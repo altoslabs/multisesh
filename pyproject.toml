@@ -1,0 +1,48 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multisesh"
+version = "0.0.25"
+description = "For combining and analysing microscope imaging data made in multiple different sessions."
+readme = "README.md"
+authors = [
+    { name = "Tom Wyatt", email = "twyatt@altoslabs.com" }
+]
+license = { text = "BSD 3-Clause License" }
+dependencies = [
+    "tifffile",
+    "jupyterlab",
+    "numpy==1.24.3",
+    "scipy",
+    "opencv-python",
+    "scikit-image",
+    "scyjava",
+    "matplotlib",
+    "aicsimageio[nd2]",
+    "aicspylibczi",
+    "readlif",
+    "fsspec",
+    "ipywidgets",
+    "ipympl",
+    "basicpy==1.1",
+    "jax==0.4.13",
+    "jaxlib==0.4.13",
+    "btrack==0.6.5",
+    "cellpose[gui]",
+    "pandas",
+    "pydantic==1.10.10"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.urls]
+homepage = "https://link-to-your-project"
+
+[tool.setuptools.dynamic]
+readme = {file = "README.md"}
