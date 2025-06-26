@@ -30,6 +30,26 @@ else:
     from . import definitions as defs
 
 
+def flatten(nested_list):
+    """
+    This function flattens lists of lists of arbitrary levels of nesting and 
+    returns one list of objects that aren't list or tuple.
+
+    Parameter
+    ---------
+    nested_list : {list,tuple}
+        Any lists or tuples in this list will be flattened out so the returned 
+        result is one flat list of objects that aren't lists or tuples.
+    """
+    result = []
+    for item in nested_list:
+        if isinstance(item, (list, tuple)):
+            result.extend(flatten(item))
+        else:
+            result.append(item)
+    return result    
+
+
 def stripTags(filename,madeBy='Andor',customTags=None):
     """ 
     This removes from a filename the file extension and the tags (which 
@@ -1996,8 +2016,27 @@ def subtract_masks(mask1,mask_sub):
     mask1[mask1==mask_sub] = 0
     
     return mask1
-    
 
+
+def and_masks(mask1,mask2):
+    """
+    Give this two labelled segmentations and this returns a new version which 
+    has had logical AND applied, taking label values into account. I.e. pixels 
+    are set to zero if they are not equal in both.  
+
+    Parameters
+    ----------
+    mask1,mask2 : numpy array (NY,NX)
+        Labelled segmentations of regions.
+    """
+
+    # these will be the new segmentations with matching labels
+    mask1 = mask1.copy()
+    mask1[mask1!=mask2] = 0
+    
+    return mask1
+
+    
 def can_write_to_folder(folder_path):
     """
     Checks in advance whether you will be able to write to a directory with 
@@ -2075,3 +2114,92 @@ def label2rgb2(array):
     array_L[array==0] = 0
     
     return colour_array[array_L]
+
+
+def regularise_df_column_names(df,
+                               channel_name_to_molecule={},
+                               segmentation_to_localisation={}):
+    """
+    multisesh RegionProps() saves df with complicated columns names. This 
+    translates them to something more handleable. The problem is that the 
+    column name contains the full path to the segmentation dataset that was 
+    used for measurement. This is important for reference. But if you are 
+    combining different datasets it's useful to have the same column names. 
+    So this detects column names with paths and deletes everything except the 
+    last part. So to make comparisons you will still need that the 
+    segmentation dataset name was the same - these are indeed often 
+    standardised by the functions that produce them so will be the same if the 
+    parameters were the same.
+
+    Note: currently assuming abs_path starts with /home. Also assuming osX 
+    path separators.
+    
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The dataframe you want to regularise the column names of. It will be 
+        processed in place.
+    channel_name_to_molecule : dict
+        For each key k it will search for '_'+k+'_' and replace with the value.
+    segmentation_to_localisation : dict
+        For each key k it will search for '_Segmentation'+k and replace with 
+        the value.
+    """
+    if channel_name_to_molecule:
+        all_chan = list([k for k,v in channel_name_to_molecule.items()])
+    if segmentation_to_localisation:
+        all_seg = list([k for k,v in segmentation_to_localisation.items()])
+        
+    for i,col in enumerate(df.columns):
+        path_patt = r'(/home(?:/[^/]+)+$)'
+        if re.search(path_patt,col):
+            full_path = re.search(path_patt,col).group(1)
+            base_name = os.path.basename(full_path)
+            new_col = re.sub(full_path,base_name,col)
+            
+            if channel_name_to_molecule:
+                for chan in all_chan: 
+                    new_col = re.sub(chan,channel_name_to_molecule[chan],new_col)
+            if segmentation_to_localisation: 
+                for seg in all_seg: 
+                    new_col = re.sub('Segmentation_'+seg,segmentation_to_localisation[seg],new_col)                
+            df.rename(columns={col:new_col},inplace=True)
+
+
+def TilePos_2_TileIndArray(TilePosY,TilePosX):
+    """
+    This is used in Session.__init__ to convert the list of tile positions 
+    (i.e. y,x coordinates) into an array called TileIndArray which relates 
+    position in the assembled montage (i.e. in terms of row and column 
+    indices) to position along the M-axis of teh Session (i.e. a single index).
+
+    Paramaeters
+    ----------
+    TilePosY/X : list of float
+        These are attributes of Session, they are a list of the positions of 
+        centres of tiles, with the ordering corresponding to the Sessions's 
+        M-axis.
+    """
+    orderedY = sorted(list(set(TilePosY)))
+    orderedX = sorted(list(set(TilePosX)))
+
+    yInd = [orderedY.index(y) for y in TilePosY]
+    xInd = [orderedX.index(x) for x in TilePosX]
+    
+    yxInd = [(y,x) for y,x in zip(yInd,xInd)]
+
+    NMY = len(orderedY)
+    NMX = len(orderedX)
+    
+    TileIndArray = np.zeros((NMY,NMX),dtype='uint16')
+
+    print(yxInd)
+    
+    for y in range(NMY):
+        for x in range(NMX):
+            pass
+            #TileIndArray[y,x] = yxInd.index((y,x))
+
+    return TileIndArray
+        
+

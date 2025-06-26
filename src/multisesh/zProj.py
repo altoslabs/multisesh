@@ -93,7 +93,53 @@ def tenengrad(image, ksize=3, mask=False,closeSize=40):
     return np.array(measures)
 
 
-def signalProj(stack,pixelSize,dscale,slices=1,proj=True,furthest=False,sliceBySlice=False,meth_fun=signalF,*args):
+def LapVar(image, 
+            ksize=11,
+            normalise=False):
+    """
+    Another common sharpness measure. 
+    
+    Parameters
+    ----------
+    image : 2D or 3D numpy array
+        The image(s).
+    ksize : int
+        The size of the sobel kernel
+    normalise : False
+        You may or may not want intensity to contribute to the focus measure. 
+        If True, then each slice will first be normalised to itself so that 
+        intensity doesn't contribute.
+    """
+    if image.ndim==2:
+        image = image[np.newaxis].copy()
+
+    measures = []
+    for i,im in enumerate(image):
+        if normalise:
+            im = im/np.max(im)  
+        laplacian = cv.Laplacian(im,cv.CV_64F,ksize=ksize)
+        measures.append(laplacian.var())
+        
+    return np.array(measures)      
+
+    measures = []
+    for i in range(image.shape[0]):
+        gx = cv.Sobel(image[i], cv.CV_64F, 1, 0, ksize=ksize)
+        gy = cv.Sobel(image[i], cv.CV_64F, 0, 1, ksize=ksize)
+        magnitude = np.sqrt(gx**2 + gy**2)
+
+    return np.array(measures)    
+
+
+def signalProj(stack,
+               pixelSize,
+               dscale=1,
+               slices=1,
+               proj=True,
+               furthest=False,
+               sliceBySlice=False,
+               meth_fun=signalF,
+               **kwargs):
     """
     A 2D projection which applies a filter to select the slice of most signal 
     for each pixel. The measure of signal is mean * std. 
@@ -124,23 +170,23 @@ def signalProj(stack,pixelSize,dscale,slices=1,proj=True,furthest=False,sliceByS
         picks the best z for each pixel based on its surroundings.
     meth_fun : python function
         The function to use for the signal sharpness quantification.
-    *args : variable
+    **kwargs : variable
         The arguments to be passed to meth_fun
     """
     NZ,YSIZE,XSIZE = np.shape(stack)  
 
     if sliceBySlice:
-        sigs = meth_fun(stack,*args)
-        slice = np.argmax(sigs)
+        sigs = meth_fun(stack,**kwargs)
+        slice1 = np.argmax(sigs)
         
         if furthest:  
-            if slice>=NZ/2:
-                slice = 0
+            if slice1>=NZ/2:
+                slice1 = 0
             else:
-                slice = NZ-1
+                slice1 = NZ-1
             
         if slices==1:
-            return stack[slice]
+            return stack[slice1]
         else:
             NAN = np.empty((YSIZE,XSIZE))
             NAN.fill(np.nan)            
@@ -148,7 +194,7 @@ def signalProj(stack,pixelSize,dscale,slices=1,proj=True,furthest=False,sliceByS
             out = np.zeros((slices,YSIZE,XSIZE))
             for s in range(slices):
                 ii = ((s+1)//2)*((-1)**s)   
-                sel = slice + ii
+                sel = slice1 + ii
                 sel[sel<0] = NZ
                 sel[sel>=NZ] = NZ
                 sel = sel.astype(int) 
@@ -171,7 +217,7 @@ def signalProj(stack,pixelSize,dscale,slices=1,proj=True,furthest=False,sliceByS
     for i,im in enumerate(stack):
         stack2[i] = generic_filter(downscale_local_mean(im,(dscale,dscale)),
                                    meth_fun,
-                                   *args,
+                                   **kwargs,
                                    footprint=selem,
                                    mode='reflect')
     stack2 = np.argmax(stack2,axis=0)
@@ -205,7 +251,13 @@ def signalProj(stack,pixelSize,dscale,slices=1,proj=True,furthest=False,sliceByS
             return out
 
         
-def findSliceSelection(stack,pixelSize,dscale,furthest=False,sliceBySlice=False,meth_fun=signalF,*args):
+def findSliceSelection(stack,
+                       pixelSize,
+                       dscale=1,
+                       furthest=False,
+                       sliceBySlice=False,
+                       meth_fun=signalF,
+                       **kwargs):
     """
     This is just the first part of signalProj, where you choose which slices 
     will form the projection.
@@ -214,7 +266,7 @@ def findSliceSelection(stack,pixelSize,dscale,furthest=False,sliceBySlice=False,
     NZ,YSIZE,XSIZE = np.shape(stack)
 
     if sliceBySlice:
-        sigs = meth_fun(stack,*args)
+        sigs = meth_fun(stack,**kwargs)
         stack2 = np.argmax(sigs)
         
         if furthest:  
@@ -233,7 +285,7 @@ def findSliceSelection(stack,pixelSize,dscale,furthest=False,sliceBySlice=False,
     for i,im in enumerate(stack):
         stack2[i] = generic_filter(downscale_local_mean(im,(dscale,dscale)),
                                    meth_fun,
-                                   *args,
+                                   **kwargs,
                                    footprint=selem,
                                    mode='reflect')
     stack2 = np.argmax(stack2,axis=0)
@@ -247,7 +299,11 @@ def findSliceSelection(stack,pixelSize,dscale,furthest=False,sliceBySlice=False,
         
     
         
-def takeSlicesSelection(selection_stack,data_stack,slices=1,proj=True,sliceBySlice=False):
+def takeSlicesSelection(selection_stack,
+                        data_stack,
+                        slices=1,
+                        proj=True,
+                        sliceBySlice=False):
     """
     This is just the last part of signalProj, you have already found which 
     slices have the signal you want and now just take them from your stack.
@@ -313,8 +369,6 @@ def takeSlicesSelection(selection_stack,data_stack,slices=1,proj=True,sliceBySli
         else:
             print(out.shape)
             return out        
-
-
 
 
 

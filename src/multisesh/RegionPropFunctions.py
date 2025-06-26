@@ -323,6 +323,13 @@ def another_mask_region_props(tdata,tindices,mask):
     also defines the crop that is sent to this function). Use this if you 
     want to get those same measurements of a different mask.
 
+    Note how the combination of tdata.RegioProps with this is a bit awkward: 
+    we want to use skimage.measure.regionprops_table() here so things are 
+    identical to tdara.RegionProps. But this expects many labelled objects 
+    forming a table with many rows - but we are passing one object at a time 
+    in a slow python loop. Probably a much better way but for now we get rid 
+    on the arrays of (one!) value in the last line here
+
     Parameters
     ----------
     tdata : ms.TData
@@ -394,7 +401,7 @@ def another_mask_region_props(tdata,tindices,mask):
 
     chan_name = tdata.Chan2[chans[0]]
     
-    out_dict = {k+'--'+chan_name:v for k,v in out_dict.items() if k not in not_needed}
+    out_dict = {k+'--'+chan_name:v[0] for k,v in out_dict.items() if k not in not_needed}
 
     return out_dict
 

@@ -146,8 +146,6 @@ od8 = 'You can\'t initiate an OutDir with no field directories inside it!'
 
 od9 = 'You can\'t initiate an OutDir with field directories that don\'t have any tiffs in!'
 
-zp1 = 'To use signalDetect you must provide an integer downscale factor which will increase the run speed (if>1).'
-
 bw1 = 'Only one txt file permitted per field directory in buildWindows.'
 
 bm1 = 'Only one tif file permitted per field directory in buildMaks.'
@@ -176,3 +174,20 @@ mg2 = 'so far we can only merge tdatas when all axis are identical except for 1.
 mg3 = 'in the axis that requires merging, there some Sesh in tdata are also in tdata2. This overlap isn\'t handled yet, although it would be easy to exclude the overlapping bits.'
 
 tr1 = 'warning: you are loading a Segmentation channel but one already exists in the tdata - the pre-existing one will be analysed'
+
+seg1 = 'addSeg2TData must be str if not False'
+
+par1 = 'Couldn\'t find your requested string C in the TData. Bad request was: '
+
+parT = 'You asked for time-point that isn\'t in the TData. In int index format you asked for: '
+parF = 'You asked for field that isn\'t in the TData. In int index format you asked for: '
+parM = 'You asked for montage tile that isn\'t in the TData. In int index format you asked for: '
+parZ = 'You asked for z-slice that isn\'t in the TData. In int index format you asked for: '
+parC = 'You asked for channel that isn\'t in the TData. In int index format you asked for: '
+
+parF1 = 'Couldn\'t find all your requested F in the TData.FieldIDs'
+parF2 = 'Couldn\'t find all your requested F in the TData.FieldIDs'
+
+parX = 'Couldn\'t load the specified segmentation channel: '
+
+get1 = 'Segmentation must be a str or XFold'

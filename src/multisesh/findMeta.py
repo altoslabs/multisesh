@@ -695,7 +695,7 @@ def allSeshMeta(tp,tps,customTags={},silenceWarnings=False):
 
         # 26/11/24 now trying just from file names since this should get the 
         # max NM then we deal with missing later
-        Ms = [re.search(r'r\d\dc\d\df(\d\d)',tpi).group(1) for tpi in tps]
+        Ms = [re.search(r'r\d\dc\d\df(\d+)',tpi).group(1) for tpi in tps]
         allMeta['NM'] = len(set(Ms))        
         
         # this also looks like it could fail in the future because we are 
@@ -743,6 +743,7 @@ def allSeshMeta(tp,tps,customTags={},silenceWarnings=False):
             DX = 1
         else:
             DX = min(diffsMX)        
+        print(posMX)
         allMeta['NMX'] = round((max(posMX)-min(posMX))/DX)+1                
         
         allMeta['TilePosX'] = posMX

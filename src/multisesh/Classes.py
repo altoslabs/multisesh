@@ -5,15 +5,16 @@ import pandas as pd
 import math
 import copy
 import ast
+import random
 from datetime import datetime
 from datetime import timedelta
 from itertools import product
 import pickle
 from skimage import io, filters, exposure, measure, feature
 from skimage.transform import downscale_local_mean,resize,rescale
-from scipy.ndimage import gaussian_filter,zoom
+from scipy.ndimage import gaussian_filter,zoom,label
 from skimage.color import label2rgb
-from skimage.morphology import disk, dilation, erosion,remove_small_objects
+from skimage.morphology import disk, dilation, erosion,remove_small_objects,binary_opening
 from skimage.segmentation import clear_border
 from scipy.ndimage.filters import generic_filter
 from sklearn.cluster import DBSCAN
@@ -41,6 +42,7 @@ from .exceptions import UnknownTifMeta,ChannelException
 from . import definitions as defs
 from . import findMeta as fMeta
 from . import errorMessages as EM
+from .macros import macro1,macro2,macro3,macro4
 
 
 class XFold:
@@ -54,8 +56,9 @@ class XFold:
     ----------
     XPath : str or list
         The path of the experiment folder. Can also be just one file. In this 
-        case the XPath is set as the files parent directory and all other 
-        files+directories in the directory as put in the Filters.
+        case the XPath is set as the file's parent directory and all other 
+        files+directories in the directory as put in the Filters. This is the 
+        absolute path, irrespective of what you provided in __init__.
     XPathP : str
         The path of the parent directory of the experiment folder. 
     XFoldName : str
@@ -134,7 +137,11 @@ class XFold:
         """
         Parameters
         ----------
-        FieldIDMapList : None or str or list of str or list of list of str or 'get_FieldIDMapList_from_tags'
+        XPath : str
+            The path to the folder or file you want to process. Can be 
+            provided as relative or absolute path.
+        FieldIDMapList : None or str or list of str or list of list of str or 
+                         'get_FieldIDMapList_from_tags'
             User provided source to build the FieldIDMapList from.
             
             If None then the Nth field of each session if given ID 'N'.
@@ -257,7 +264,7 @@ class XFold:
             relative to XPathP. 
         Chan/Chan2 : list of list of str
             The Chan of the Sessions.
-        OriginalXFold : None or str of ms.XFold
+        OriginalXFold : {None,str,ms.XFold}
             Allows building an XFold from an image dataset with no metadata 
             (other than SeshQ specified by filename tags) by taking the 
             metadata from the XFold specified by the str (i.e. filepath) or 
@@ -276,9 +283,9 @@ class XFold:
             ffs = [f for f in os.listdir(XPath2) if f!=XFile]
             MustNOTContain += [os.path.join(XPath2,f) for f in ffs]
             XPath = XPath2
-        
-        self.XPath = XPath
+
         assert os.path.exists(XPath), 'The XPath you provided doesn\'t exist'
+        self.XPath = os.path.abspath(XPath)
         assert os.path.split(self.XPath)[0]!='',EM.xf1
         self.XPathP = os.path.split(self.XPath)[0]
         self.XFoldName = os.path.split(self.XPath)[1]
@@ -390,13 +397,30 @@ class XFold:
 
         self.SegmentationXFolds = {}
 
+        self.Shape = [s.Shape for s in self.SessionsList]
+        self.NT = [s.NT for s in self.SessionsList]
+        self.NF = [s.NF for s in self.SessionsList]
+        self.NM = [s.NM for s in self.SessionsList]
+        self.NZ = [s.NZ for s in self.SessionsList]
+        self.NC = [s.NC for s in self.SessionsList]
+        self.NY = [s.NY for s in self.SessionsList]
+        self.NX = [s.NX for s in self.SessionsList]        
         self.Chan = [s.Chan for s in self.SessionsList]
         self.Chan2 = [s.Chan2 for s in self.SessionsList]
+        self.MadeBy = [s.MadeBy for s in self.SessionsList]
+        self.NMY = [s.NMY for s in self.SessionsList]        
+        self.NMX = [s.NMX for s in self.SessionsList]    
+        self.TStep = [s.TStep for s in self.SessionsList]
+        self.ZStep = [s.ZStep for s in self.SessionsList] 
+        self.pixSizeY = [s.pixSizeY for s in self.SessionsList]     
+        self.pixSizeX = [s.pixSizeX for s in self.SessionsList]
+        self.pixUnit = [s.pixUnit for s in self.SessionsList]
            
         if SaveXFoldPickle:
             if not os.path.exists(SaveXFoldPickle):
                 with open(SaveXFoldPickle, 'wb') as file:
                     pickle.dump(self,file)
+        
 
     def Assertions(self):
         """Put any final checks during XFold initiation here."""
@@ -1415,7 +1439,7 @@ class XFold:
         sessions : None or list or int
             If None then it processes all sessions. If a list of int then the 
             int are the session indices.    
-        T,F,M,Z : {'all',int,list,str}
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             The indices of the data points that you want to process.
             'all' for all, int for one index, list for list of indices
             or for C you can request one channel or a list of channels by
@@ -1455,6 +1479,8 @@ class XFold:
         saveSegmentations : None or str
             Whether to save the segmentation masks. Str will be the name of 
             the folder they are saved into.
+        verbose : bool
+            Whether to print progress            
         printWarnings : bool
             Just lets you turn off warnings if they get annoying.    
         compress : bool
@@ -1462,12 +1488,6 @@ class XFold:
         allowMissing : bool
             If True then missing data will be loaded as black files and 
             segmentation will be run as normal on that.            
-
-        Returns
-        --------
-        allSegs : list of numpy array
-            List, each element is session and contains an array which has 
-            shape of data except for the channels axis removed.
         """
                      
         if isinstance(sessions,list):
@@ -1526,7 +1546,7 @@ class XFold:
                                  blur_sig=blur_sig,
                                  clear_borderQ=clear_borderQ,
                                  remove_small=remove_small,
-                                 addSeg2TData=True,
+                                 addSeg2TData='auto',
                                  printWarnings=printWarnings,
                                  compress=compress)
 
@@ -1534,6 +1554,158 @@ class XFold:
                     tdata.TakeSubStack(C='Segmentation',updateNewSeshNQ=True)
                     tdata.SaveData(saveSegmentations,compress=compress)
 
+
+    def Segment(self,
+                 seg_chan,
+                 sessions=None,
+                 T='all',
+                 F='all',
+                 M='all',
+                 Z='all',
+                 mask=False,
+                 returnSigNoise=False,
+                 maskOutput=False,
+                 method=False,
+                 erodeMask=None,
+                 blur_sig=None,
+                 clip_sig=None,    
+                 watershed_seg=None,
+                 closing=None,
+                 removeSmall=None,
+                 clearBorder=False,
+                 saveSegmentations=None,       
+                 compress=False,
+                 zProject=False,  
+                 verbose=False,    
+                 allowMissing=False
+               ):
+        """
+        This segments all the data in the XFold using Segment. Note that it 
+        loads every individual T,F,M,Z and segments each, to avoid this (e.g. 
+        if you first want to zProject or Stitch) you will for now have to do 
+        that yourself using the TData method CellPose.
+        
+        Parameters
+        ----------
+        seg_chan : int or str
+            The channel index or name you want to segment. 
+        sessions : None or list or int
+            If None then it processes all sessions. If a list of int then the 
+            int are the session indices.    
+        T,F,M,Z : {'all',int,list,tuple,range,str}
+            The indices of the data points that you want to process.
+            'all' for all, int for one index, list for list of indices
+            or for C you can request one channel or a list of channels by
+            name(s) and for F you can request one field or list of fields by
+            its ID(s). Currently the same points are selected in each Session 
+            but in future it should allow lists of selections so each 
+            Session's selection can be independent.      
+        mask : str or False or array-like
+            This is an image which defines a region of arbitrary shape to
+            decide which pixels to include in the calculation of threshold. It 
+            can be input as a string to indicate a template-matched mask (see 
+            parameter in TData.ExtractProfileRectangle).      
+        returnSigNoise : bool
+            Whether to return the eroded and dilated-inverted masks for 
+            definite signal and definite noise.
+        maskOutput : bool
+            Whether to use the original mask to restrict the area of returned 
+            masks. I.e. the mask is intially used to restrict area taken into 
+            account for the threshold calculation, whereas this controls 
+            whether regions outside that mask appear at all in the returned 
+            masks.
+        method : bool or cv parameter.
+            Default is to use otsu. Put cv.THRESH_TRIANGLE to try that method.
+        erodeMask : bool or ints
+            If int then it will erode the first mask to stop side edge pixels 
+            being taken into account in the threshold calculation.
+        blur_sig : int or False
+            Sometimes useful to blur the image a bit before segmentation 
+            because cell pose does too detailed segmentation for high 
+            resolution images. 
+        clip_sig : int or False
+            Sometimes useful to clip the image a bit before segmentation. If 
+            this is an int then all pixels above this value will be set to 
+            this value.           
+        closing : None or int
+            The rectangular kernel size of the morphological opening if you 
+            chose to do it.
+        removeSmall : None or int
+            Remove objects with area smaller than this (in pixels).
+        clearBorder : bool
+            Whether to clear the segmentation mask border.
+        saveSegmentations : None or str
+            Whether to save the segmentation masks. Str will be the name of 
+            the folder they are saved into. This deletes everything except for 
+            the segmentation just before saving because SaveData doesn't yet 
+            have one channel only.     
+        compress : bool
+            Whether the saved files should be compressed or not. 
+        zProject : bool
+            Whether to do maximum projection of your data first. If False then 
+            it always takes first Z throughout Session, i.e. kind of assuming 
+            there is only one Z.
+        verbose : bool
+            Whether to print progress.
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            segmentation will be run as normal on that.            
+        """
+                     
+        if isinstance(sessions,list):
+            sesh = [self.SessionsList[s] for s in sessions]
+        elif isinstance(sessions,int):
+            sesh = [self.SessionsList[sessions]]
+        else:
+            sesh = self.SessionsList                     
+            
+        for i,s in enumerate(sesh):
+            if verbose:
+                print('Session: ',i)
+
+            TT,FF,MM,ZZ,sc2 = s.parseTFMZC(T=T,F=F,M=M,Z=Z,C=seg_chan)
+            if zProject:
+                ZZ2 = ZZ
+                ZZ = [0]
+            sc2 = sc2[0]
+
+    
+            for t,f,m,z in product(TT,FF,MM,ZZ):
+                if verbose:
+                    print('t: ',t,' f: ',f,' m: ',m,' z: ',z)
+
+                if zProject:
+                    tdata = s.makeTData(T=t,F=f,M=m,Z=ZZ2,
+                                        C=seg_chan,
+                                        allowMissing=allowMissing)
+                    tdata.zProject()
+                else:
+                    tdata = s.makeTData(T=t,F=f,M=m,Z=z,
+                                        C=seg_chan,
+                                        allowMissing=allowMissing)
+                
+                tdata.Segment(
+                            seg_chan=0,
+                            mask=mask,
+                            returnSigNoise=returnSigNoise,
+                            maskOutput=maskOutput,
+                            method=method,
+                            erodeMask=erodeMask,
+                            blur_sig=blur_sig,
+                            clip_sig=clip_sig,  
+                            watershed_label=watershed_label,
+                            addSeg2TData='auto',
+                            closing=closing,
+                            removeSmall=removeSmall,
+                            clearBorder=clearBorder,
+                            saveSegmentationsAndDelete=False,
+                            compress=compress,
+                            )
+
+                if saveSegmentations:
+                    tdata.TakeSubStack(C='Segmentation',updateNewSeshNQ=True)
+                    tdata.SaveData(saveSegmentations,compress=compress)
+    
     
     def YOLOSAM(self,
                  diameter,
@@ -1573,7 +1745,7 @@ class XFold:
         sessions : None or list
             If None then it processes all sessions. If a list of int then the 
             int are the session indices.  
-        T,F,M,Z : {'all',int,list,str}
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             The indices of the data points that you want to process.
             'all' for all, int for one index, list for list of indices
             or for C you can request one channel or a list of channels by
@@ -1667,7 +1839,7 @@ class XFold:
             The name of the directory where the tracks (h5 files) and tracked 
             masks (if saveMask is True) will be stored. It is assumed to be in 
             the parent directory of the XFold.
-        T,F,M,Z : 'all' or list of int
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             !! NOT implemented yet !!
             Which session times, fields, tiles and slices to load.          
         saveMasks : bool 
@@ -1772,8 +1944,90 @@ class XFold:
         Session.makeTData.
         """
         sesh = self.SessionsList[S]
-        return sesh.makeTData(T,F,M,Z,C,allowMissing,MY,MX,Segmentation)           
+        return sesh.makeTData(T,F,M,Z,C,allowMissing,MY,MX,Segmentation)         
+
+
+    
+    def get_segmentation_xfold(self,
+                               Segmentation,
+                               assumeConstantDims='auto',
+                               FieldIDMapList='auto',
+                               SaveXFoldPickle=False,
+                               LoadFromPickle=False,                               
+                               returnXFold=True):
+        """
+        This makes the XFold of the Segmentation dataset specified by 
+        Segmentation. It checks if it is already in self.SegmentationXFolds 
+        and loads it if not and also returns it if requested.
         
+        Parameters
+        ----------
+        Segmentation : {str,ms.XFold}
+            Ultimately this must be the absolute path to the Segmentation 
+            dataset but if you provide a string with no directory divisors it 
+            will prepend the path of the parent directory to self's root and 
+            it will convert relative paths to absolute paths. For wierd reasons
+            it is sometimes useful to be able to just hand the xfold you are 
+            trying to get too!
+        assumeConstantDims : bool or 'auto'       
+            X
+        FieldIDMapList : None or str or list of str or list of list of str 
+                         or 'get_FieldIDMapList_from_tags' or 'auto' 
+            X
+        SaveXFoldPickle : bool or str
+            X
+        LoadFromPickle : bool or str
+            All of these get passed to XFold __init__ when the new XFold is 
+            made. If you choose 'auto' for assumeConstantDims or 
+            FieldIDMapList then it sends the value from self to the new 
+            __init__.     
+        returnXFold : bool
+            Whether to return the XFold that was created. I.e. otherwise it is 
+            just loaded to self.SegmentationXFolds.
+        """
+        assert isinstance(Segmentation,(str,XFold)),EM.get1
+
+        if isinstance(Segmentation,XFold):
+            Segmentation = Segmentation.XPath
+        
+        if os.path.split(Segmentation)[0]=='':
+            Segmentation = os.path.join(self.XPathP,Segmentation)
+        Segmentation = os.path.abspath(Segmentation)
+        
+        if Segmentation not in self.SegmentationXFolds.keys():
+            if assumeConstantDims=='auto':
+                assumeConstantDims = self.assumeConstantDims
+            if FieldIDMapList=='auto':
+                FieldIDMapList = self.FieldIDMapListIn            
+                
+            xf = XFold(Segmentation,
+                        assumeConstantDims=assumeConstantDims,
+                        OriginalXFold=self,
+                        FieldIDMapList=FieldIDMapList,
+                        SaveXFoldPickle=SaveXFoldPickle,
+                        LoadFromPickle=LoadFromPickle)
+
+            # this bit looks strange but is important. multisesh allows 
+            # loading of compressed data with no metadata, only 'OriginalXFold'
+            # - from which it takes metadata that isn't stored in the filenames 
+            # of the compressed files. But Chan is not in the OriginalXFold 
+            # for a Segmentation dataset because it is a new channel that was 
+            # created! AND our convention is that Session.Chan should be 
+            # 'Segmentation_'+XPath. That convention seemed like a good idea 
+            # because it means you never loose track of where your segmentation
+            # came from. But here it's complicated because you can't really 
+            # save that in the filename so the information is almost lost in 
+            # compressed files... so here you retrieve it again from the XPath 
+            # of the XFold.
+            for s in xf.SessionsList:
+                s.Chan = ['Segmentation_'+xf.XPath]
+            
+            self.SegmentationXFolds[Segmentation] = xf
+
+        if returnXFold:
+            return self.SegmentationXFolds[Segmentation]    
+
+    
 
     def SaveDataFrameCrops(self,
                            df,
@@ -1898,7 +2152,7 @@ class XFold:
                 seg = seg.data[0,0,0,0,0].copy()
             elif maskOutput:
                 assert 'Segmentation' in tdata.Chan,EM.sf2
-                ccc = tdata.chan_index('Segmentation')
+                _,_,_,_,ccc = tdata.parseTFMZC(C='Segmentation')
                 seg = tdata.data[0,0,0,0,ccc].copy()
 
             _,_,_,_,chan_int = tdata.parseTFMZC(C=all_chan)
@@ -1939,7 +2193,9 @@ class XFold:
                     F='all',
                     M='all',
                     Z='all',
-                    allowMissing=False
+                    zProject=False,
+                    allowMissing=False,
+                    whole_image=False
                    ):
         """
         This does the equivalent to TData.RegionProps: it labels regions and 
@@ -1962,12 +2218,12 @@ class XFold:
             shouldn't mess label ordering up by trying to relabel... but the 
             decision of whether it is labelled or not is quite basic (see 
             genF.isLabelledMaskQ)            
-            !!Important note if using extra functions!! - The image send to 
+            !!Important note if using extra functions!! - The image sent to 
             the function is cropped from the raw data according to the limits 
-            of each region in this segmentation. So all regions you want to 
+            of each region in THIS segmentation. So all regions you want to 
             use in functions must be within this segmentation. E.g. if you are 
             measuring nuclear and cytoplasmic signals, put the cytoplasmic 
-            Segmentations here and the nuclear segmentations in the function.    
+            segmentations here and the nuclear segmentations in the function.    
             !!Important note 2 if using extra functions!! - the label from 
             this mask will be passed to the function and it may be assumed 
             (depending on the function) that segmentations passed directly to 
@@ -1984,16 +2240,21 @@ class XFold:
         tracking : bool
             Whether to consider this a tracking dataset so most sgape stuff 
             will be thrown away and some new columns will be calculated.
-        T,F,M,Z : {'all',int,list,str}
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             The indices of the data points that you want to process.
             'all' for all, int for one index, list for list of indices
             and for F you can request one field or list of fields by
             its ID(s). Currently the same points are selected in each Session
             but in future it should allow lists of selections so each 
             Session's selection can be independent.    
+        zProject : bool
+            Whether to maximum project the data before measuring.
         allowMissing : bool
             If True then missing data will be loaded as black files and 
-            RegionProperties will be run as normal on that.                
+            RegionProperties will be run as normal on that.     
+        whole_image : bool
+            If True then it doesn't label the mask (and unlabels labelled 
+            masks), so the whole image/mask gets sent to regionprops.            
             
         Returns
         -------
@@ -2036,21 +2297,32 @@ class XFold:
             if tracking:
                 TT = ['all']
 
+            if zProject:
+                ZZ = ['all']
+
             for t,f,m,z in product(TT,FF,MM,ZZ):
                 if verbose:
                     print('s: ',iss,' t: ',t,' f: ',f,' m: ',m,' z: ',z)
 
-                tdata = s.makeTData(T=t,F=f,M=m,Z=z,
+                tdata = s.makeTData(T=t,
+                                    F=f,
+                                    M=m,
+                                    Z=z,
                                     C=all_data_chan,
-                                    Segmentation=all_seg_chan,
                                     allowMissing=allowMissing)
+                
+                if zProject:
+                    tdata.zProject()              
+                
+                tdata.LoadSegmentationChannel(Segmentation=all_seg_chan,)
 
                 df_sub = tdata.RegionProps(Segmentation=Segmentation,
                                        fun=fun,
                                        returnDF=True,
                                        saveDF=False,
                                        verbose=False,
-                                       tracking=tracking)
+                                       tracking=tracking,
+                                       whole_image=whole_image)
                 
                 df = pd.concat([df,df_sub])
 
@@ -2059,9 +2331,9 @@ class XFold:
                 saveDF = os.path.join(self.XPathP,saveDF)
             if not saveDF[-4:]=='.csv':
                 saveDF = saveDF+'.csv'
-            df_full.to_csv(saveDF)
+            df.to_csv(saveDF)
         if returnDF:
-            return df_full
+            return df
 
 
     def FillInMissingSessions(self,xfold=False):
@@ -2121,7 +2393,7 @@ class XFold:
         out_nuc_seg,out_cyto_seg : str
             The filepath to save the new segmentation datasets. If no file 
             divisors here it is assumed to be in self's parent directory.
-        T,F,M,Z : {'all',int,list,str}
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             The indices of the data points that you want to process.
             'all' for all, int for one index, list for list of indices
             or for F you can request one field or list of fields by
@@ -2135,7 +2407,6 @@ class XFold:
         allowMissing : bool
             If True then missing data will be loaded as black files and 
             alignment will be run as normal on that.    
-            
         """
         if isinstance(nuc_seg,str):
             xf_n = self.get_segmentation_xfold(nuc_seg)
@@ -2194,7 +2465,7 @@ class XFold:
         out_mask : str
             The filepath to save the new segmentation dataset. If no file 
             divisors here it is assumed to be in self's parent directory.
-        T,F,M,Z : {'all',int,list,str}
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             The indices of the data points that you want to process.
             'all' for all, int for one index, list for list of indices
             or for F you can request one field or list of fields by
@@ -2209,10 +2480,8 @@ class XFold:
             If True then missing data will be loaded as black files and 
             mask subtraction will be run as normal on that.               
         """
-        if isinstance(mask1,str):
+        if isinstance(mask1,(str,XFold)):
             xf_c = self.get_segmentation_xfold(mask1)
-        elif isinstance(mask1,XFold):
-            xf_c = mask1
         else:
             raise Exception('mask1 must be str or XFold')
             
@@ -2236,20 +2505,182 @@ class XFold:
                 tdata_C.SaveData(out_mask,compress=compress)
 
 
+    def AndMasks(self,
+                    mask1,
+                    mask2,
+                    out_mask,
+                    T='all',
+                    F='all',
+                    M='all',
+                    Z='all',
+                    verbose=True,
+                    compress=False,
+                    allowMissing=False):
+        """
+        You give this two labelled Segmentation datasets (that are aligned, 
+        i.e. were calculated from the same raw dataset, ideally self) and this 
+        saves a new version which has had logical AND applied, taking label 
+        values into account. I.e. pixels are set to zero if they are not equal 
+        in both.
+        
+        Parameters
+        ----------
+        mask1,mask2 : {str,ms.XFold}
+            The two Segmentation sets you want to AND. str must be a 
+            filepath to root folder of dataset or if no file divisors found it 
+            is assumed to be in self's parent directory. Or directly give the 
+            XFold of the dataset.
+        out_mask : str
+            The filepath to save the new segmentation dataset. If no file 
+            divisors here it is assumed to be in self's parent directory.
+        T,F,M,Z : {'all',int,list,tuple,range,str}
+            The indices of the data points that you want to process.
+            'all' for all, int for one index, list for list of indices
+            or for F you can request one field or list of fields by
+            its ID(s). Currently the same points are selected in each Session 
+            but in future it should allow lists of selections so each 
+            Session's selection can be independent. 
+        verbose : bool
+            Whether to print progress.
+        compress : bool
+            Whether to compress the masks.
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.              
+        """
+        if isinstance(mask1,str):
+            xf_c = self.get_segmentation_xfold(mask1)
+        elif isinstance(mask1,XFold):
+            xf_c = mask1
+        else:
+            raise Exception('mask1 must be str or XFold')
+            
+        if isinstance(mask2,str):
+            xf_n = self.get_segmentation_xfold(mask2)
+        elif isinstance(mask2,XFold):
+            xf_n = mask2
+        else:
+            raise Exception('mask2 must be str or XFold') 
+
+        for i,s in enumerate(self.SessionsList):
+            TT,FF,MM,ZZ,_ = s.parseTFMZC(T=T,F=F,M=M,Z=Z)
+            for t,f,m,z in product(TT,FF,MM,ZZ):
+                if verbose:
+                    print('t: ',t,' f: ',f,' m: ',m,' z: ',z)
+                tdata_C = xf_c.makeTData(i,t,f,m,z,allowMissing=allowMissing)
+                tdata_N = xf_n.makeTData(i,t,f,m,z,allowMissing=allowMissing)
+                cs2 = genF.and_masks(tdata_C.data[0,0,0,0,0],
+                                                     tdata_N.data[0,0,0,0,0])
+                tdata_C.data[0,0,0,0,0] = cs2
+                tdata_C.SaveData(out_mask,compress=compress)    
+
+    
+
+    def ClearSegmentationBorders(self,
+                    mask1,
+                    out_mask,
+                    mask_al=None,
+                    out_mask_al=None,
+                    T='all',
+                    F='all',
+                    M='all',
+                    Z='all',
+                    verbose=True,
+                    compress=False,
+                    allowMissing=False):
+        """
+        You give this a labelled Segmentation dataset (that is derived from 
+        self) and this saves a new version of the Segmentation with regions 
+        that were touching the borders removed.
+        
+        Parameters
+        ----------
+        mask1 : str or ms.XFold
+            The Segmentation set you want remove border regions from. If str 
+            the it must be a filepath to root folder of dataset or if no file 
+            divisors found it is assumed to be in self's parent directory. Or 
+            directly give the XFold of the dataset.
+        out_mask : str
+            The filepath to save the new segmentation dataset. If no file 
+            divisors here it is assumed to be in self's parent directory.
+        mask_al : str or ms.XFold
+            If there is an aligned set of masks then specify it here and any 
+            border objects removed from mask1 will be removed from this. Note 
+            this should be the 'smaller' of the masks, i.e. if mask1 is 
+            cytoplasms this should be nuclei. The objects here don't 
+            necesarily need to be touching the border!... just the object from 
+            mask1 does.
+        out_mask_al : str
+            The filepath to save the new segmentation dataset. If no file 
+            divisors here it is assumed to be in self's parent directory.
+        T,F,M,Z : {'all',int,list,tuple,range,str}
+            The indices of the data points that you want to process.
+            'all' for all, int for one index, list for list of indices
+            or for F you can request one field or list of fields by
+            its ID(s). Currently the same points are selected in each Session 
+            but in future it should allow lists of selections so each 
+            Session's selection can be independent. 
+        verbose : bool
+            Whether to print progress
+        compress : bool
+            Whether to compress the masks.
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.              
+        """
+        xf_c = self.get_segmentation_xfold(mask1)
+
+            
+        if mask_al:
+            xf_c_al = self.get_segmentation_xfold(mask_al)
+
+        for i,s in enumerate(self.SessionsList):
+            TT,FF,MM,ZZ,_ = s.parseTFMZC(T=T,F=F,M=M,Z=Z)
+            for t,f,m,z in product(TT,FF,MM,ZZ):
+                if verbose:
+                    print('t: ',t,' f: ',f,' m: ',m,' z: ',z)
+                td_S = xf_c.makeTData(i,t,f,m,z,allowMissing=allowMissing)
+
+                _data0 = td_S.data.reshape((td_S.NY,td_S.NX))
+                _data = clear_border(_data0)
+
+                # we have to do this next rubbish because we often end up with 
+                # annoying masks where somehow there is a disconnected pixel 
+                # in a labelled object. i.e. a pixel of value lab right next 
+                # to all the other pixels of value lab but not quite 
+                # connected... think this comes from cellpose?
+                removed_lab = np.unique(_data0[_data0!=_data])
+                _data[np.isin(_data,removed_lab)] = 0
+                
+                td_S.data = _data.reshape((1,1,1,1,1,td_S.NY,td_S.NX))
+
+                td_S.SaveData(out_mask,compress=compress)
+
+                if mask_al:
+                    td_S_al = xf_c_al.makeTData(i,t,f,m,z,allowMissing=allowMissing)     
+                    isin_mask = np.isin(td_S_al.data,td_S.data)
+                    td_S_al.data[~isin_mask] = 0
+
+                if out_mask_al:
+                    td_S_al.SaveData(out_mask_al,compress=compress)
+    
+
 
     def CleanMasks(self,
-                   in_mask,
-                   out_mask,
+                   Segmentation,
+                   saveCleanedSegmentations,
                    areaThreshold=None,
                    minAreaUnit='um^2',                   
                    circThreshold=None,
-                   clearBorder=False,                    
-                   printWarnings=True,
+                   clearBorder=False, 
+                   removeSmallDisconnected=False,
                    compress=True,
                    T='all',
                    F='all',
                    M='all',
-                   Z='all',):
+                   Z='all',
+                   verbose=True,
+                   allowMissing=False):
         """
         You give this a labelled Segmentation dataset (that is derived from 
         self) and this removes border objects, objects smaller than a threshold
@@ -2261,11 +2692,15 @@ class XFold:
 
         Parameters
         ----------
-        in_mask : str or ms.XFold
+        Segmentation : str or ms.XFold
             The Segmentation set you want clean. If str the it must be a 
             filepath to root folder of dataset or if no file divisors found it 
             is assumed to be in self's parent directory. Or directly give the 
             XFold of the dataset.
+        saveCleanedSegmentations : str
+            Str will be the name of the folder they are saved into. This 
+            deletes everything except for the segmentation just before saving 
+            because SaveData doesn't yet have one channel only option.                
         areaThreshold : None or int or float
             If you want to remove objects smaller than a threshold then enter 
             it here. It is assumed to be in um^2.
@@ -2276,34 +2711,28 @@ class XFold:
             threshold then enter it here.
         clearBorder : bool
             Whether to remove objects touching the image border.
-        addAsNew : bool
-            If True then it makes a new mask and adds as a new channel with 
-            the same name as before but with 
-            '_borderCleared_areaThresholdXX_circThresholdXX' added according 
-            to what you chose.
-        saveSegmentationsAndDelete : None or str
-            Whether to save the cleaned segmentation masks. Str will be the 
-            name of the folder they are saved into. This deletes everything 
-            except for the segmentation just before saving because SaveData 
-            doesn't yet have one channel only option.              
-        printWarnings : bool
-            Just lets you turn off warnings if they get annoying.    
+        removeSmallDisconnected : bool    
+            If True then it checks every object to see if it is made of 
+            multiple disconnected components. If it is then it deletes every 
+            part except for the part with the biggest area. It will probably be
+            a good idea that you then use areThreshold to remove small bits in 
+            case the remaining bit is small.                    
         compress : bool
             Whether the saved files should be compressed or not.   
-        T,F,M,Z : {'all',int,list,str}
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             The indices of the data points that you want to process.
             'all' for all, int for one index, list for list of indices
             or for F you can request one field or list of fields by
             its ID(s). Currently the same points are selected in each Session 
             but in future it should allow lists of selections so each 
-            Session's selection can be independent.             
+            Session's selection can be independent.  
+        verbose : bool
+            Whether to print progress.   
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.               
         """
-        if isinstance(in_mask,str):
-            xf_c = self.get_segmentation_xfold(in_mask)
-        elif isinstance(in_mask,XFold):
-            xf_c = in_mask
-        else:
-            raise Exception('in_mask must be str or XFold')
+        xf_c = self.get_segmentation_xfold(Segmentation)
 
         for i,s in enumerate(self.SessionsList):
             TT,FF,MM,ZZ,_ = s.parseTFMZC(T=T,F=F,M=M,Z=Z)
@@ -2312,72 +2741,16 @@ class XFold:
                     print('t: ',t,' f: ',f,' m: ',m,' z: ',z)
                 td_S = xf_c.makeTData(i,t,f,m,z,allowMissing=allowMissing)
 
-                td_S.CleanMasks(C='Segmentation',
-                               areaThreshold=areaThreshold,
-                               minAreaUnit=minAreaUnit,
-                               circThreshold=circThreshold,
-                               clearBorder=clearBorder,    
-                               editDirectly=False,
-                               addAsNew=False,
-                               saveSegmentationsAndDelete=None,                     
-                               printWarnings=printWarnings,
-                               compress=compress)  
-    
-    
-    def get_segmentation_xfold(self,
-                               Segmentation,
-                               assumeConstantDims='auto',
-                               FieldIDMapList='auto',
-                               SaveXFoldPickle=False,
-                               LoadFromPickle=False,                               
-                               returnXFold=True):
-        """
-        This makes the XFold of the Segmentation dataset specified by 
-        Segmentation. It checks if it is already in self.SegmentationXFolds 
-        and loads it with if not and returns it if requested.
-        
-        Parameters
-        ----------
-        Segmentation : str
-            Ultimately this must be the absolute path to the Segmentation 
-            dataset but if you provide a string with no directory divisors it 
-            will prepend the path of the parent directory to self's root and 
-            it will convert relative paths to absolute paths.
-        assumeConstantDims : bool or 'auto'       
-        FieldIDMapList : None or str or list of str or list of list of str 
-                         or 'get_FieldIDMapList_from_tags' or 'auto' 
-        SaveXFoldPickle : bool or str
-        LoadFromPickle : bool or str
-            All of these get passed to XFold __init__ when the new XFold is 
-            made. If you choose 'auto' for assumeConstantDims or 
-            FieldIDMapList then it sends the value from self to the new 
-            __init__.     
-        returnXFold : bool
-            Whether to return the XFold that was created. I.e. otherwise it is 
-            just loaded to self.SegmentationXFolds.
-        """
-        assert isinstance(Segmentation,str),'Segmentation must be a str'
-        
-        if os.path.split(Segmentation)[0]=='':
-            Segmentation = os.path.join(self.XPathP,Segmentation)
-            
-        Segmentation = os.path.abspath(Segmentation)
-        
-        if Segmentation not in self.SegmentationXFolds.keys():
-            if assumeConstantDims=='auto':
-                assumeConstantDims = self.assumeConstantDims
-            if FieldIDMapList=='auto':
-                FieldIDMapList = self.FieldIDMapListIn            
-                
-            self.SegmentationXFolds[Segmentation] = XFold(Segmentation,
-                                        assumeConstantDims=assumeConstantDims,
-                                        OriginalXFold=self,
-                                        FieldIDMapList=FieldIDMapList,
-                                        SaveXFoldPickle=SaveXFoldPickle,
-                                        LoadFromPickle=LoadFromPickle)
-
-        if returnXFold:
-            return self.SegmentationXFolds[Segmentation]
+                td_S.CleanMasks(Segmentation='Segmentation',
+                        areaThreshold=areaThreshold,
+                        minAreaUnit=minAreaUnit,
+                        circThreshold=circThreshold,
+                        clearBorder=clearBorder,    
+                        removeSmallDisconnected=removeSmallDisconnected,
+                        editMasksInPlace=False,
+                        addAsNewChannel=False,
+                        saveSegmentationsAndDelete=saveCleanedSegmentations,
+                        compress=compress)  
 
 
     def zProject(self,  
@@ -2389,15 +2762,16 @@ class XFold:
                  Z='all',
                  C='all',
                  meth='maxProject',
-                 downscale=None,
+                 downscale=1,
                  slices=1,
-                 fur=False,
+                 furthest=False,
                  chan=None,
                  proj_best=True,
                  sliceBySlice=False,
                  meth_fun=signalF,
-                 *args,
-                 verbose=False):
+                 allowMissing=False,
+                 verbose=False,                 
+                 **kwargs,):
         """
         z-projection of all data in the XFold.
 
@@ -2418,8 +2792,12 @@ class XFold:
             Session's selection can be independent.
         verbose : bool
             Whether to print progress.
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.             
         see TData.zProject() for other parameters.
         """
+        
         if isinstance(sessions,list):
             sesh = [self.SessionsList[s] for s in sessions]
         elif isinstance(sessions,int):
@@ -2432,24 +2810,116 @@ class XFold:
                 print('Session: ',i)
 
             TT,FF,MM,ZZ,CC = s.parseTFMZC(T=T,F=F,M=M,Z=Z,C=C)
-    
-            for t,f,m,c in product(TT,FF,MM,CC):
+
+            # if specifiying chan then you need all channels in each tdata
+            if isinstance(chan,int) or isinstance(chan,str):
+                for t,f,m in product(TT,FF,MM):
+                    if verbose:
+                        print('t: ',t,' f: ',f,' m: ',m)
+                        
+                    tdata = s.makeTData(T=t,
+                                        F=f,
+                                        M=m,
+                                        Z=ZZ,
+                                        allowMissing=allowMissing)
+                    tdata.zProject(meth=meth,
+                                   downscale=downscale,
+                                   slices=slices,
+                                   furthest=furthest,
+                                   chan=chan,
+                                   proj_best=proj_best,
+                                   sliceBySlice=sliceBySlice,
+                                   meth_fun=meth_fun,
+                                   verbose=False                               
+                                   **kwargs,)
+            else:
+                for t,f,m,c in product(TT,FF,MM,CC):
+                    if verbose:
+                        print('t: ',t,' f: ',f,' m: ',m)
+                        
+                    tdata = s.makeTData(T=t,
+                                        F=f,
+                                        M=m,
+                                        Z=ZZ,
+                                        C=c,
+                                        allowMissing=allowMissing)
+                    tdata.zProject(meth=meth,
+                                   downscale=downscale,
+                                   slices=slices,
+                                   furthest=furthest,
+                                   chan=chan,
+                                   proj_best=proj_best,
+                                   sliceBySlice=sliceBySlice,
+                                   meth_fun=meth_fun,
+                                   verbose=False                               
+                                   **kwargs,)
+            tdata.SaveData(outDir)
+
+
+
+    def DownSize(self,
+                 outDir,
+                 downsize,
+                 sessions=None,
+                 T='all',
+                 F='all',
+                 M='all',
+                 Z='all',
+                 C='all',
+                 verbose=False,
+                 allowMissing=False,
+                ):
+        """
+        Downsize all data in an xfold.        
+
+        Parameters
+        ----------
+        outDir : str
+            The directory to which to save the zProjections.
+        downsize : int or list
+            If int then downsize x and y by this factor.
+            If list [y,x] then downsize by different factors y and x.            
+        sessions : None or list or int
+            If None then it processes all sessions. If a list of int then the 
+            int are the session indices.    
+        T,F,M,Z,C : {'all',int,list,str}
+            The indices of the data points that you want to process.
+            'all' for all, int for one index, list for list of indices
+            or for C you can request one channel or a list of channels by
+            name(s) and for F you can request one field or list of fields by
+            its ID(s). Currently the same points are selected in each Session 
+            but in future it should allow lists of selections so each 
+            Session's selection can be independent.  
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.              
+        """
+
+        if isinstance(sessions,list):
+            sesh = [self.SessionsList[s] for s in sessions]
+        elif isinstance(sessions,int):
+            sesh = [self.SessionsList[sessions]]
+        else:
+            sesh = self.SessionsList 
+
+        for i,s in enumerate(sesh):
+            if verbose:
+                print('Session: ',i)
+
+            TT,FF,MM,ZZ,CC = s.parseTFMZC(T=T,F=F,M=M,Z=Z,C=C)
+            for t,f,m in product(TT,FF,MM):
                 if verbose:
                     print('t: ',t,' f: ',f,' m: ',m)
                     
-                tdata = s.makeTData(T=t,F=f,M=m,Z=ZZ,C=c)
-                tdata.zProject(meth=meth,
-                               downscale=downscale,
-                               slices=slices,
-                               fur=fur,
-                               chan=chan,
-                               proj_best=proj_best,
-                               sliceBySlice=sliceBySlice,
-                               meth_fun=meth_fun,
-                               *args,
-                               verbose=False)
-                tdata.SaveData(outDir)
+                tdata = s.makeTData(T=t,
+                                    F=f,
+                                    M=m,
+                                    Z=ZZ,
+                                    allowMissing=allowMissing)
+                tdata.DownSize(downsize)
+                tdata.SaveData(outDir)    
 
+    
     
     def Label2Edges(self,
                     outDir,
@@ -2462,7 +2932,8 @@ class XFold:
                     M='all',
                     Z='all',      
                     verbose=False,
-                    compress=False
+                    compress=False,
+                    allowMissing=False,
                    ):
         """
         This converts all masks in the XFold to just their edge with a 
@@ -2490,7 +2961,7 @@ class XFold:
         sessions : None or list or int
             If None then it processes all sessions. If a list of int then the 
             int are the session indices.    
-        T,F,M,Z : {'all',int,list,str}
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             The indices of the data points that you want to process.
             'all' for all, int for one index, list for list of indices.
             For F you can request one field or list of fields by
@@ -2501,6 +2972,9 @@ class XFold:
             Whether to print progress. 
         compress : bool
             Whether to compress the saved output.
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.             
         """
         if Segmentation:
             xf = self.get_segmentation_xfold(Segmentation)
@@ -2526,14 +3000,184 @@ class XFold:
                 if verbose:
                     print('t: ',t,' f: ',f,' m: ',m,' z: ',z)
                     
-                tdata = s.makeTData(T=t,F=f,M=m,Z=z,C=c)
+                tdata = s.makeTData(T=t,F=f,M=m,Z=z,C=c,allowMissing=allowMissing)
                 tdata.data[0,0,0,0,0] = genF.labelMask2Edges(
                                                         tdata.data[0,0,0,0,0],
                                                         outwards=outwards,
                                                         thickness=thickness)
                 tdata.SaveData(outDir,compress=compress)
 
+
+    def RemoveUnmatchedSegmentationObjects(self,
+                                           Segmentation1,
+                                           Segmentation2,
+                                           saveRematchedSeg1,
+                                           saveRematchedSeg2,
+                                           sessions=None,                                           
+                                           T='all',
+                                           F='all',
+                                           M='all',
+                                           Z='all',      
+                                           verbose=False,                                           
+                                           compress=True,
+                                           allowMissing=False):
+        """
+        This takes two Segmentations which must be labelled and matching (e.g. 
+        like each cytoplasm and associated nuclei have the same label, see 
+        XFold.AlignSegmentationLabels()) and removes objects (i.e. labels) in 
+        either if they don't appear in both. Note that this is nothing to do 
+        with where labels appear, i.e. nothing about whether things overlap... 
+        just about whether a label appears or not. It is used e.g when you 
+        have 'cleaned' 2 matching segmentations and want objects to be removed 
+        in both if removed in one.
         
+        Parameters
+        ----------
+        Segmentation1/Segmentation2 : {str,ms.XFold}
+            The Segmentation sets you want to process. See 
+            tdata.LoadSegmentationChannel() for accepted formats.
+        saveRematchedSeg1,saveRematchedSeg2 : str
+            The filepaths to save the new segmentation datasets. If no file 
+            divisors here it is assumed to be in self's parent directory. 
+        addSeg1AsNewChannel,addSeg2AsNewChannel : {bool,'auto',str}
+            If True or str then it adds the new masks as new channels. If True 
+            or 'auto' the Chan2 name will be made from the segmentation 
+            dataset name +"_UnmatchedRemoved" and passed through 
+            tdata.parseSegNameToChan2. If a different str is provided then the 
+            Chan2 name is this str passed through tdata.parseSegNameToChan2().
+        sessions : {None,list,tuple,int}
+            If None then it processes all sessions. If a list of int then the 
+            int are the session indices.    
+        T,F,M,Z : {'all',int,list,tuple,range,str}
+            The indices of the data points that you want to process.
+            'all' for all, int for one index, list for list of indices.
+            For F you can request one field or list of fields by
+            its ID(s). Currently the same points are selected in each Session 
+            but in future it should allow lists of selections so each 
+            Session's selection can be independent.    
+        verbose : bool
+            Whether to print progress.        
+        compress : bool
+            Whether the saved files should be compressed or not.  
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.             
+        """
+
+        if isinstance(sessions,(list,tuple)):
+            sesh = [self.SessionsList[s] for s in sessions]
+        elif isinstance(sessions,int):
+            sesh = [self.SessionsList[sessions]]
+        else:
+            sesh = self.SessionsList 
+            
+        for i,s in enumerate(sesh):
+            if verbose:
+                print('Session: ',i)
+
+            TT,FF,MM,ZZ,_ = s.parseTFMZC(T=T,F=F,M=M,Z=Z)
+            for t,f,m,z in product(TT,FF,MM,ZZ):
+                if verbose:
+                    print('t: ',t,' f: ',f,' m: ',m,' z: ',z)
+                tdata = s.makeTData(T=t,F=f,M=m,Z=z,C=None,
+                                    Segmentation=[Segmentation1,Segmentation2],
+                                    allowMissing=allowMissing)
+                tdata.RemoveUnmatchedSegmentationObjects(
+                                           Segmentation1,
+                                           Segmentation2,
+                                           saveSeg1AndDelete=saveRematchedSeg1,
+                                           saveSeg2AndDelete=saveRematchedSeg2,
+                                           addSeg1AsNewChannel=False,
+                                           addSeg2AsNewChannel=False,
+                                           editSeg1InPlace=False,
+                                           editSeg2InPlace=False,
+                                           compress=compress)
+    
+
+    def BranchesAndBodiesFromMask(self,
+                                opening_size,
+                                Segmentation=False,                                  
+                                saveBodies=False,
+                                saveBranches=False,
+                                sessions=None,
+                                T='all',
+                                F='all',
+                                M='all',
+                                Z='all',      
+                                verbose=False,
+                                compress=False,
+                                allowMissing=False
+                                 ):
+        """
+        This takes the specified masks and uses morphological opening to 
+        separate them into branches (bits that are removed upon opening) and 
+        bodies (what's left after opening). 
+
+        Parameters
+        ----------
+        Segmentation : {False,str,XFold}
+            If False then it just works on any channels in self that are 
+            called Segmentation. Otherwise it does nothing to self but does it 
+            all to the full external XFold specified by Segmentation - in that 
+            case Segmentation can be the absolute or relative path or just the 
+            folder name if it is in self.XPathP. Can be the Segmentation XFold 
+            itself too.
+        opening_size : int
+            The size of the footprint used in opening.            
+        saveBodies,saveBranches : {False,str}
+            Where to save the new XFold.            
+        sessions : {None,list,int}
+            If None then it processes all sessions. If a list of int then the 
+            int are the session indices.    
+        T,F,M,Z : {'all',int,list,tuple,range,str}
+            The indices of the data points that you want to process.
+            'all' for all, int for one index, list for list of indices.
+            For F you can request one field or list of fields by
+            its ID(s). Currently the same points are selected in each Session 
+            but in future it should allow lists of selections so each 
+            Session's selection can be independent.    
+        verbose : bool
+            Whether to print progress. 
+        compress : bool
+            Whether to compress the saved output.
+        allowMissing : bool
+            If True then missing data will be loaded as black files and 
+            mask subtraction will be run as normal on that.             
+        """
+        if Segmentation:
+            xf = self.get_segmentation_xfold(Segmentation)
+        else:
+            xf = self
+
+        if isinstance(sessions,list):
+            sesh = [xf.SessionsList[s] for s in sessions]
+        elif isinstance(sessions,int):
+            sesh = [xf.SessionsList[sessions]]
+        else:
+            sesh = xf.SessionsList 
+            
+        for i,s in enumerate(sesh):
+            if verbose:
+                print('Session: ',i)
+
+            CC = [c1 for c1,c2 in zip(s.Chan,s.Chan2) if c2=='Segmentation']
+
+            TT,FF,MM,ZZ,_ = s.parseTFMZC(T=T,F=F,M=M,Z=Z)
+    
+            for t,f,m,z,c in product(TT,FF,MM,ZZ,CC):
+                if verbose:
+                    print('t: ',t,' f: ',f,' m: ',m,' z: ',z,' c: ',c)
+                    
+                tdata = s.makeTData(T=t,F=f,M=m,Z=z,C=c,allowMissing=allowMissing)
+                tdata.BranchesAndBodiesFromMask(
+                               Segmentation=xf,
+                               opening_size=opening_size,
+                               saveBodiesAndDelete=saveBodies,
+                               saveBranchesAndDelete=saveBranches,
+                               addBodiesAsNewChannels=False,
+                               addBranchesAsNewChannels=False,
+                               compress=compress)         
+
 
 class Session:
     """ 
@@ -2749,6 +3393,12 @@ class Session:
         self.TilePosY = self.allMeta['TilePosY']    
 
         self.MontageOrder = self.allMeta['MontageOrder']
+
+        if self.MontageOrder=='TilePos':
+            self.TileIndArray = genF.TilePos_2_TileIndArray(self.TilePosY,
+                                                            self.TilePosX)
+        else:
+            self.TileIndArray = None        
         
         if self.TilePosX and self.TilePosY:
             self.LRUPOrdering = np.lexsort((self.TilePosX,self.TilePosY))
@@ -2946,7 +3596,7 @@ class Session:
     def makeTData(self,T='all',F='all',M='all',Z='all',C='all',
                   allowMissing=False,MY=False,MX=False,Segmentation=False):
         """
-        This builds a user specified TData from a session.
+        This builds a user specified TData from a Session.
 
         Parameters
         ----------
@@ -2965,18 +3615,13 @@ class Session:
             the rows and columns according to LRUP ordering and it does the 
             rest. Have only made it work for opera where you have the 
             positions so far. 
-        Segmentation : False or str or list
+        Segmentation : {False,str,ms.XFold,list}
             If you have a corresponding dataset of segmentations that you can 
             make an exactly corresponding XFold of, then this adds the matching
-            segmentation to the TData as a final channel. You can provide 
-            Segmentation as a relative or absolute path, or if you provide a 
-            string with no directory divisors it prepends the ParentXFold's 
-            XPathP. The channel self.Chan2 name will be 'Segmentation_' + 
-            exactly what you provided here as Segmentation (i.e. no conversion 
-            to absolute paths etc) - the prepending of 'Segmentation_' means 
-            the self.Chan name will automatically be 'Segmentation'. You can 
-            provide a list of strings to add multiple new Segmenation channels.
-        
+            segmentation to the TData as a final channel. See 
+            TData.LoadSegmentationChannel for accepted formats and for 
+            explanation of what the TData.Chan2 entry will be.
+            
         Returns
         --------
         tdata : TData
@@ -3149,41 +3794,53 @@ class Session:
 
         tdataD = TData(pTFs,fullData,*userSel,self)
                       
-        if isinstance(Segmentation,str):
-            Segmentation = [Segmentation]
         if Segmentation:
-            for seg in Segmentation:
-                tdataD.LoadSegmentationChannel(seg,
-                                           Chan='Segmentation_'+seg)
+            tdataD.LoadSegmentationChannel(Segmentation)
         
         return tdataD
 
                       
-    def parseTFMZC(self,T='all',F='all',M='all',Z='all',C='all'):
+    def parseTFMZC(self,
+                   T='all',
+                   F='all',
+                   M='all',
+                   Z='all',
+                   C='all',
+                   allowSeshZNone=True):
         """
-        This takes FTMZC in all formates and converts to indices for that 
-        Session.
+        This takes user requested T/F/M/Z/C in all accepted formats (see 
+        Parameters) and returns a flat list of ints which are the indices of 
+        the requested parts. 
         
-        It accepts 'all', int, -1 and list of int. For C it accepts channel 
-        names. It accepts C either converted by chanDic or not: it checks for 
-        non-converted in self.Chan first, then checks in self.Chan2. Note that 
-        asking for converted version might be easier (i.e. you can type DAPI 
-        without having to remember what the original channel was called) but 
-        if there happens to be another channel that coverts to it (i.e. 
-        another 'DAPI') you could end up with the wrong one! For F it accepts 
-        FieldID also.
-        
-        Note this doesn't have the extra feature that TData.parseTFMZC() has 
-        that it also searches C for 'Segmentation_'+C because this is never 
-        added to Session.Chan only to TData.Chan2.
+        Parameters
+        ----------
+        T,M,Z : {'all',int,list,tuple,range,False}
+            'all' gives indices for whole axis in TData. int specifies one and 
+            can also be negative to count backwards from the end. 
+            Lists and tuples must be ints but can be nested to arbitrary 
+            levels and then is returned flattened. range is converted to list. 
+            False returns [].
+        F : {'all',int,str,list,tuple,range,False}
+            Like T,M,Z but also you can request as FieldID as str - this works 
+            in lists and tuples too.
+        C : {'all',int,str,list,tuple,range,ms.XFold,False}
+            Like T,M,Z but also you can request as channel name as str. This 
+            can be the self.Chan2 or self.Chan - it checks Chan2 first. 
+        allowSeshZNone : bool
+            The specific case (which comes up often) of a tdata being 
+            zProjected so that tdata.SeshZ==[None] leads to functions then 
+            using this function here requesting Z=[None]. Usually in that case 
+            you want Z=[0].
         """
 
         if T=='all':
             TT = list(range(self.NT))
-        elif T==-1 or T==[-1]:
-            TT = [self.NT - 1]        
-        elif isinstance(T,list) and all([isinstance(t,int) for t in T]):
-            TT = T.copy()     
+        elif isinstance(T,(int,np.integer)) and T<0:
+            TT = [self.NT + T]   
+        elif isinstance(T,range):
+            TT = list(T)    
+        elif isinstance(T,(list,tuple)):
+            TT = genF.flatten([self.parseTFMZC(T=t)[0] for t in T])               
         elif isinstance(T,(int,np.integer)):
             TT = [int(T)]       
         elif not T:
@@ -3193,19 +3850,17 @@ class Session:
             
         if F=='all':
             FF = list(range(self.NF))
-        elif F==-1 or F==[-1]:
-            FF = [self.NF - 1]
+        elif isinstance(F,(int,np.integer)) and F<0:
+            FF = [self.NF + F]
+        elif isinstance(F,range):
+            FF = list(F)            
         elif isinstance(F,(int,np.integer)):
             FF = [int(F)]
-        elif isinstance(F,list) and all([isinstance(f,int) for f in F]):
-            FF = F.copy()
+        elif isinstance(F,(list,tuple)):
+            FF = genF.flatten([self.parseTFMZC(F=f)[1] for f in F])
         elif isinstance(F,str):        
-            assert f in self.FieldIDMap,'Couldn\'t find all your requested F in the TData.FieldIDs'
+            assert F in self.FieldIDMap,'Couldn\'t find all your requested F in the TData.FieldIDs'
             FF = [self.FieldIDMap.index(F)]
-        elif isinstance(F,list) and all([isinstance(f,str) for f in F]):
-            check = all([f in self.FieldIDMap for f in F] )
-            assert check,'Couldn\'t find all your requested F in the TData.FieldIDs'
-            FF = [self.FieldIDMap.index(f) for f in F] 
         elif not F:
             FF = []            
         else:
@@ -3213,10 +3868,12 @@ class Session:
             
         if M=='all':
             MM = list(range(self.NM))
-        elif M==-1 or M==[-1]:
-            MM = [self.NM - 1]           
-        elif isinstance(M,list) and all([isinstance(m,int) for m in M]):
-            MM = M.copy()    
+        elif isinstance(M,(int,np.integer)) and M<0:
+            MM = [self.NT + M]  
+        elif isinstance(M,range):
+            MM = list(M)            
+        elif isinstance(M,(list,tuple)):
+            MM = genF.flatten([self.parseTFMZC(M=m)[2] for m in M]) 
         elif isinstance(M,(int,np.integer)):
             MM = [int(M)] 
         elif not M:
@@ -3226,23 +3883,29 @@ class Session:
             
         if Z=='all':
             ZZ = list(range(self.NZ))    
-        elif Z==-1 or Z==[-1]:
-            ZZ = [self.NZ - 1]        
-        elif isinstance(Z,list) and all([isinstance(z,int) for z in Z]):
-            ZZ = Z.copy()    
+        elif Z==[None] and allowSeshZNone:
+            ZZ = [0]            
+        elif isinstance(Z,(int,np.integer)) and Z<0:
+            ZZ = [self.NT + Z]  
+        elif isinstance(Z,range):
+            ZZ = list(Z)            
+        elif isinstance(Z,(list,tuple)):
+            ZZ = genF.flatten([self.parseTFMZC(Z=z)[3] for z in Z])
         elif isinstance(Z,(int,np.integer)):
             ZZ = [int(Z)] 
         elif not Z:
             ZZ = []              
         else:
-            raise Exception('Z was not supplied in a supported format!')        
+            raise Exception('Z was not supplied in a supported format!')
             
         if C=='all':
             CC = list(range(self.NC))
-        elif C==-1 or C==[-1]:
-            CC = [self.NC - 1]        
-        elif isinstance(C,list) and all([isinstance(c,int) for c in C]):
-            CC = C.copy()     
+        elif isinstance(C,(int,np.integer)) and C<0:
+            CC = [self.NT + C]     
+        elif isinstance(C,range):
+            CC = list(C)            
+        elif isinstance(C,(list,tuple)):
+            CC = genF.flatten([self.parseTFMZC(C=c)[4] for c in C]) 
         elif isinstance(C,(int,np.integer)):
             CC = [int(C)]        
         elif isinstance(C,str):
@@ -3251,32 +3914,11 @@ class Session:
             elif C in self.Chan2:
                 CC = [self.Chan2.index(C)]
             else: 
-                raise ChannelException('Couldn\'t find all your requested C in the TData')
-        elif isinstance(C,list) and all([isinstance(c,str) for c in C]):
-            CC = []
-            for c in C:
-                if c in self.Chan:
-                    CC.append(self.Chan.index(c))                 
-                elif c in self.Chan2:
-                    CC.append(self.Chan2.index(c))
-                else:
-                    raise ChannelException('couldn\'t find channel '+c+' in Session')
-        elif isinstance(C,list) and all([(isinstance(c,int) or isinstance(c,str)) for c in C]):
-            CC = []
-            for c in C:
-                if isinstance(c,int):
-                    CC.append(c)
-                else:
-                    if c in self.Chan:
-                        CC.append(self.Chan.index(c))                    
-                    elif c in self.Chan2:
-                        CC.append(self.Chan2.index(c))
-                    else:
-                        raise ChannelException('couldn\'t find channel '+c+' in Session')
+                raise ChannelException(EM.par1+C)
         elif not C:
             CC = []              
         else:
-            raise ChannelException('C was not supplied in a supported format!')        
+            raise ChannelException('C was not supplied in a supported format!')      
     
         return (TT,FF,MM,ZZ,CC)
 
@@ -3716,133 +4358,179 @@ class TData:
                          'ZStep':self.ZStep,
                          'Times':self.Times               
                         }        
-
-    def parseTFMZC(self,T='all',F='all',M='all',Z='all',C='all'):
-        """
-        This takes FTMZC in all accepted formats (see below) and converts to 
-        indices for that tdata.
         
-        It accepts 'all', int, -1 and list of int. For C it accepts channel 
-        names. It accepts C either converted by chanDic or not: it checks for 
-        non-converted in self.Chan2 first, then checks in self.Chan. Note that 
-        asking for converted version might be easier (i.e. you can type DAPI 
-        without having to remember what the original channel was called) but 
-        if there happens to be another channel that coverts to it (i.e. another
-        'DAPI') you could end up with the wrong one! For F it accepts FieldID 
-        also.
 
-        One more feature is that in Chan2 it also seaches for 
-        'Segmentation_'+C because of the special case that 
-        Session.makeTData(Segmentation=C) will add 'Segmentation_' to 
-        self.Chan2 so that chanDic converts it to 'Segmentation'.
+    def parseTFMZC(self,
+                   T='all',
+                   F='all',
+                   M='all',
+                   Z='all',
+                   C='all',
+                   LoadMissingSegmention=False,
+                  ):
+        """
+        This takes user requested T/F/M/Z/C in all accepted formats (see 
+        Parameters) and returns a flat list of ints which are the indices of 
+        the requested parts. Has option to Load segmentations if they're not 
+        already found in the TData.
+
+        Parameters
+        ----------
+
+        T,M,Z : {'all',int,list,tuple,range,False}
+            'all' gives indices for whole axis in TData. int specifies one and 
+            can also be negative to count backwards from the end. 
+            Lists and tuples must be ints but can be nested to arbitrary 
+            levels and then is returned flattened. We chose to always 
+            completely flatten because of complications with how this function 
+            always returns a tuple of lists so a single int for C is turned to 
+            a list length one so things get non-uniformwhen applying it 
+            recursively to nested lists. range is converted to list. False 
+            returns [].
+        F : {'all',int,str,list,tuple,range,False}
+            Like T,M,Z but also you can request as FieldID as str - this works 
+            in lists and tuples too.
+        C : {'all',int,str,list,tuple,range,ms.XFold,False}
+            Like T,M,Z but also you can request as channel name as str. This 
+            can be the self.Chan2 or self.Chan - it checks Chan2 first. After 
+            checking Chan2 it will first also check if 
+            self.parseSegNameToChan2(C) is in Chan2 so you can reference a 
+            Segmentation dataset in any of the standard ways (see 
+            parseSegNameToChan2). This works in lists and tuples too.
+        LoadMissingSegmention : bool
+            If True then it once it has not found C in Chan2 or Chan it then 
+            tries to load the specified C as a segmentation channel.
+            
+        Thought
+        -------
+        One day should these this one let you select by SeshQs too?
+
         """
         if T=='all':
             TT = list(range(self.NT))
-        elif T==-1 or T==[-1]:
-            TT = [self.NT - 1]        
-        elif isinstance(T,list) and all([isinstance(t,int) for t in T]):
-            TT = T.copy()     
-        elif isinstance(T,int):
+        elif isinstance(T,(int,np.integer)) and T<0:
+            TT = [self.NT + T]
+        elif isinstance(T,range):
+            TT = list(T)
+        elif isinstance(T,(list,tuple)):
+            TT = genF.flatten([self.parseTFMZC(T=t)[0] for t in T])
+        elif isinstance(T,(int,np.integer)):
             TT = [T]   
         elif not T:
             TT = []              
         else:
-            raise Exception('T was not supplied in a supported format!')    
+            raise Exception('T was not supplied in a supported format!')
+        assert all([t<self.NT and t>=0 for t in TT]),EM.parT+str(TT)
             
         if F=='all':
             FF = list(range(self.NF))
-        elif F==-1 or F==[-1]:
-            FF = [self.NF - 1]
-        elif isinstance(F,int):
+        elif isinstance(F,(int,np.integer)) and F<0:
+            FF = [self.NF + F]
+        elif isinstance(F,range):
+            FF = list(F)            
+        elif isinstance(F,(int,np.integer)):
             FF = [F]
-        elif isinstance(F,list) and all([isinstance(f,int) for f in F]):
-            FF = F.copy()
+        elif isinstance(F,(list,tuple)):
+            FF = genF.flatten([self.parseTFMZC(F=f)[1] for f in F])
         elif isinstance(F,str):        
-            assert f in self.FieldIDs,'Couldn\'t find all your requested F in the TData.FieldIDs'
+            assert F in self.FieldIDs,EM.parF1
             FF = [self.FieldIDs.index(F)]
-        elif isinstance(F,list) and all([isinstance(f,str) for f in F]):
-            check = all([f in self.FieldIDs for f in F] )
-            assert check,'Couldn\'t find all your requested F in the TData.FieldIDs'
-            FF = [self.FieldIDs.index(f) for f in F] 
         elif not F:
             FF = []              
         else:
-            raise Exception('F was not supplied in a supported format!')    
+            raise Exception('F was not supplied in a supported format!')   
+        assert all([f<self.NF and f>=0 for f in FF]),EM.parF+str(FF)
             
         if M=='all':
             MM = list(range(self.NM))
-        elif M==-1 or M==[-1]:
-            MM = [self.NM - 1]           
-        elif isinstance(M,list) and all([isinstance(m,int) for m in M]):
-            MM = M.copy()    
-        elif isinstance(M,int):
+        elif isinstance(M,(int,np.integer)) and M<0:
+            MM = [self.NM + M]
+        elif isinstance(M,range):
+            MM = list(M)            
+        elif isinstance(M,(list,tuple)):
+            MM = genF.flatten([self.parseTFMZC(M=m)[2] for m in M])
+        elif isinstance(M,(int,np.integer)):
             MM = [M]    
         elif not M:
             MM = []              
         else:
             raise Exception('M was not supplied in a supported format!')        
+        assert all([m<self.NM and m>=0 for m in MM]),EM.parM+str(MM)
             
         if Z=='all':
             ZZ = list(range(self.NZ))    
-        elif Z==-1 or Z==[-1]:
-            ZZ = [self.NZ - 1]        
-        elif isinstance(Z,list) and all([isinstance(z,int) for z in Z]):
-            ZZ = Z.copy()    
-        elif isinstance(Z,int):
+        elif isinstance(Z,(int,np.integer)) and Z<0:
+            ZZ = [self.NZ + Z]  
+        elif isinstance(Z,range):
+            ZZ = list(Z)            
+        elif isinstance(Z,(list,tuple)):
+            ZZ = genF.flatten([self.parseTFMZC(Z=z)[3] for z in Z])
+        elif isinstance(Z,(int,np.integer)):
             ZZ = [Z]  
         elif not Z:
             ZZ = []              
         else:
-            raise Exception('Z was not supplied in a supported format!')        
-            
+            raise Exception('Z was not supplied in a supported format!')     
+        assert all([z<self.NZ and z>=0 for z in ZZ]),EM.parZ+str(ZZ)
+
+        if isinstance(C,XFold):
+            C = C.XPath
         if C=='all':
             CC = list(range(self.NC))
-        elif C==-1 or C==[-1]:
-            CC = [self.NC - 1]        
-        elif isinstance(C,list) and all([isinstance(c,int) for c in C]):
-            CC = C.copy()     
-        elif isinstance(C,int):
+        elif isinstance(C,(int,np.integer)) and C<0:
+            CC = [self.NC + C]        
+        elif isinstance(C,range):
+            CC = list(C)
+        elif isinstance(C,(list,tuple)):
+            CC = genF.flatten([self.parseTFMZC(C=c)[4] for c in C])            
+        elif isinstance(C,(int,np.integer)):
             CC = [C]        
-        elif isinstance(C,str):
+        elif isinstance(C,str):           
             if C in self.Chan2:
                 CC = [self.Chan2.index(C)]
-            elif 'Segmentation_'+C in self.Chan2:
-                CC = [self.Chan2.index('Segmentation_'+C)]
+            elif self.parseSegNameToChan2(C) in self.Chan2:
+                CC = [self.Chan2.index(self.parseSegNameToChan2(C))]
             elif C in self.Chan:
                 CC = [self.Chan.index(C)]
+            elif LoadMissingSegmention:
+                try:
+                    self.LoadSegmentationChannel(C)
+                    CC = [self.Chan2.index(self.parseSegNameToChan2(C))]
+                except:
+                    raise ChannelException(EM.parX+C)
             else: 
-                raise ChannelException('Couldn\'t find all your requested C in the TData')
-        elif isinstance(C,list) and all([isinstance(c,str) for c in C]):
-            CC = []
-            for c in C:
-                if c in self.Chan2:
-                    CC.append(self.Chan2.index(c))
-                elif 'Segmentation_'+c in self.Chan2:
-                    CC.append(self.Chan2.index('Segmentation_'+c))
-                elif c in self.Chan:
-                    CC.append(self.Chan.index(c))
-                else:
-                    raise ChannelException('couldn\'t find channel '+c+' in Session')  
-        elif isinstance(C,list) and all([(isinstance(c,int) or isinstance(c,str)) for c in C]):
-            CC = []
-            for c in C:
-                if isinstance(c,int):
-                    CC.append(c)
-                else:
-                    if c in self.Chan2:
-                        CC.append(self.Chan2.index(c))
-                    elif 'Segmentation_'+c in self.Chan2:
-                        CC.append(self.Chan2.index('Segmentation_'+c))                       
-                    elif c in self.Chan:
-                        CC.append(self.Chan.index(c))
-                    else:
-                        raise ChannelException('couldn\'t find channel '+c+' in Session') 
+                raise ChannelException(EM.par1+C)
         elif not C:
-            CC = []  
+            CC = []
         else:
-            raise ChannelException('C was not supplied in a supported format!')        
+            raise ChannelException('C was not supplied in a supported format!')
+        assert all([c<self.NC and c>=0 for c in CC]),EM.parC+str(CC)
     
         return (TT,FF,MM,ZZ,CC)
+
+
+    def parseSegNameToChan2(self,Segmentation):
+        """
+        This takes a string used to specify a segmentation dataset and 
+        converts it to the equivalent for tdata.Chan2. Basically the user 
+        might provide just a name or a full path (absolute or relative) and 
+        the tdata.Chan2 name should always be 'Segmentation_'+abs_path.
+
+        Parameters
+        ----------
+        Segmentation : {str,ms.XFold}
+            The string that you want to convert to a Chan2 string. Or if you 
+            give the XFold of a segmentation itself the it gets the XPath from
+            this.
+        """
+        if isinstance(Segmentation,XFold):
+            Segmentation = Segmentation.XPath
+        if os.path.split(Segmentation)[0]=='':
+            Segmentation = os.path.join(self.ParentXFold.XPathP,Segmentation)        
+            
+        Segmentation = os.path.abspath(Segmentation)
+            
+        return 'Segmentation_'+Segmentation
 
     
     def TakeSubStack(self,
@@ -3920,15 +4608,15 @@ class TData:
 
         Parameter
         ---------
-        endChans : tuple or None or 'Auto'
-            Output data will have these channels. If None or 'Auto' then it
+        endChans : tuple or None or 'auto'
+            Output data will have these channels. If None or 'auto' then it
             will get set of all channels that appear in all sessions and order
             according to XFold.chanOrder.
         """
         if np.prod(np.array(self.Shape))==0:
             return
 
-        if endChans == None or endChans == 'Auto':
+        if endChans == None or endChans == 'auto':
             pxfold = self.ParentXFold
             allSesh = [c for s in pxfold.SessionsList for c in s.Chan]
             endChans = set(allSesh)
@@ -3987,14 +4675,16 @@ class TData:
         if self.pixSizeX:
             self.pixSizeX = self.pixSizeX/downsize[1]
 
-        self.updateDimensions()            
+        self.updateDimensions()     
+        self.newSeshNY = self.NY
+        self.newSeshNX = self.NX
+        self.newSeshTilePosY = [y/downsize[0] for y in self.ParentSession.TilePosY]
+        self.newSeshTilePosX = [x/downsize[0] for x in self.ParentSession.TilePosX]
         
         self.Aligned = False
 
         if verbose:
             print('Downsized by: ',str(downsize))
-
-        print('Warning: we havent updated self.newNQ in this function yet so saving and reloading might have troubles.')
 
 
     def EmptyQ(self):
@@ -4053,6 +4743,162 @@ class TData:
         print('Warning: we havent updated self.newSeshNQ in this function yet so saving and reloading might have troubles.')
 
 
+    def makeBaSiCFilters(self,ij,chan='All',darkfield=True,blur=False):
+        """
+        This makes filters for homgenisation using the imagej BaSiC plugin.
+
+        Parameters
+        ----------
+        ij : imagej gateway
+            Use pyimagej to make a gateway to an imagej app that has BaSiC
+            installed.
+        chan : str or list of str
+            The channel names to calculate filters for. 'All' for all channels
+            in TData. Can but ints providing positions within self.chan too.
+        darkfield : bool
+            Whether to calculate the darkfield filter or not.
+        blur : bool or int
+            Whether to apply gaussian blur to the calculated filter. If int
+            then this is the size of the gaussian kernel.
+
+        Returns
+        -------
+        filtDic : dict
+            Keys are channel names (str), values are tuple of numpy arrays.
+            The first is the flatfield filter the second is the darkfield.
+
+        Notes
+        -----
+        It uses the whole TData (from a specific channel) to make the filter.
+        So if you want unique filters per time point or field then you have to
+        make each TData with just one tp/field accordingly. Similarly you
+        should z-project first if you are going to z-project.
+        """
+
+        if np.prod(np.array(self.Shape))==0:
+            return
+
+        if isinstance(chan,str) and chan!='All':
+            chan = [chan]
+        if chan=='All':
+            chan = [i for i in range(len(self.Chan))]
+        elif isinstance(chan,list):
+            if all([isinstance(c,str) for c in chan]):
+                chan = [self.Chan.index(c) for c in chan]
+            elif not all([isinstance(c,int) for c in chan]):
+                raise Exception('chan not in recognisable format.')
+        else:
+            raise Exception('chan not in recognisable format.')
+            
+        # you can't do BaSiC with one image
+        if not self.NM*self.NT*self.NZ*self.NF > 1:
+            raise Exception('need more than 1 im / chan to make BaSiC filter')
+
+        filtDic = {}
+
+        for c in chan:
+            filtDic[self.Chan[c]] = {}
+            im = self.data[:,:,:,:,c].copy()
+            d = (self.NT*self.NF*self.NM*self.NZ,self.NY,self.NX)
+            im = im.reshape(d)
+            im = ij.py.to_java(im)
+            im = ij.op().transform().flatIterableView(im)
+            ij.ui().show(im)
+            WindowManager = jimport('ij.WindowManager')
+            current_image = WindowManager.getCurrentImage()
+            ij.py.run_macro(macro1)
+            s_m = '[Estimate both flat-field and dark-field]'
+            args = {'processing_stack': 'active-1',
+                    'flat-field': 'None',
+                    'dark-field': 'None',
+                    'shading_estimation': '[Estimate shading profiles]',
+                    'shading_model': s_m,
+                    'setting_regularisationparametes': 'Automatic',
+                    'temporal_drift': '[Ignore]',
+                    'correction_options': '[Compute shading only]',
+                    'lambda_flat': 0.5,
+                    'lambda_dark': 0.5}
+            ij.py.run_plugin('BaSiC ', args)
+            ij.py.run_macro(macro2)
+            current_image = WindowManager.getCurrentImage()
+            flat_field_ij = ij.py.from_java(current_image)
+            flat_field = flat_field_ij.data
+            ij.py.run_macro(macro3)
+            current_image = WindowManager.getCurrentImage()
+            dark_field_ij = ij.py.from_java(current_image)
+            dark_field = dark_field_ij.data
+            ij.py.run_macro(macro4)
+            filtDic[self.Chan[c]]['FF'] = flat_field
+            filtDic[self.Chan[c]]['DF'] = dark_field
+            del im,flat_field,dark_field
+
+        if blur:
+            assert isinstance(blur,int),'blur must be an int'
+            for k,v in filtDic.items():
+                for k2,v2 in v.items():
+                    filtDic[k][k2] = cv.GaussianBlur(v2,(0,0),blur)
+
+
+        return filtDic
+
+
+    def makeBaSiCFilters_py(self,chan='All',darkfield=True,newsize=128):
+        """
+        This makes filters for homgenisation using the BaSiC algorithm.
+
+        Parameters
+        ----------
+        chan : str or list of str
+            The channel names to calculate filters for. 'All' for all channels
+            in TData. Can but ints providing positions within self.chan too.
+        darkfield : bool
+            Whether to calculate the darkfield filter or not.
+        newsize : int
+            A size that they resize down to, I guess to save processing time.
+            They always use 128 but let's allow it as a variable.
+        Returns
+        -------
+        filtDic : dict
+            Keys are channel names (str), values are tuple of numpy arrays.
+            The first is the flatfield filter the second is the darkfield.
+
+        Notes
+        -----
+        It uses the whole TData (from a specific channel) to make the filter.
+        So if you want unique filters per time point or field then you have to
+        make each TData with just one tp/field accordingly. Similarly you
+        should z-project first if you are going to z-project.
+
+        I have just combined 2 parts of their
+
+        """
+
+        if np.prod(np.array(self.Shape))==0:
+            return
+
+        if isinstance(chan,str) and chan!='All':
+            chan = [chan]
+        if chan=='All':
+            chan = [i for i in range(len(self.Chan))]
+        elif isinstance(chan,list):
+            if all([isinstance(c,str) for c in chan]):
+                chan = [self.Chan.index(c) for c in chan]
+            elif not all([isinstance(c,int) for c in chan]):
+                raise Exception('chan not in recognisable format.')
+        else:
+            raise Exception('chan not in recognisable format.')
+
+        filtDic = {}
+        NIM = self.NF*self.NT*self.NM*self.NZ
+        for c in chan:
+            filtDic[self.Chan[c]] = {}
+            fData = self.data.copy().reshape((NIM,self.NY,self.NX))
+            fData = np.moveaxis(fData,0,2).astype('uint16')
+            fData = cv2.resize(fData,(128,128),interpolation=cv2.INTER_LANCZOS4)
+            ff,df = pybasic.basic(fData,segmentation=None,darkfield=True)
+            filtDic[self.Chan[c]]['FF'] = ff
+            filtDic[self.Chan[c]]['DF'] = df
+            del fData,ff,df
 
 
     def Homogenise(self,HFiles={},chan='All',verbose=False):
@@ -4187,19 +5033,130 @@ class TData:
     
     
 
+    def filterBrightObjects(self,
+                            chan,
+                            thresh=False,
+                            quan=0.9,
+                            kernThresh=5,
+                            kernRepl=21,
+                            removeLargeHigh=False,
+                            removeSmallHigh=False,
+                            diagnose=False):
+        """
+        Removes sparse high-signal objects to aid viewing low
+        signal of image. Any pixel where the local (kernThresh) mean is above
+        the Nth quantile intensity is replaced by the mean of its
+        neighbourhood (kernReplace) which is calculated after high intensity
+        pixels removed from this neighbourhood.
+
+        Parameters
+        ----------
+        chan : int or str
+            The channel that you perform this on. Either its index in
+            self.Chan or its name.
+        thresh : False or int or 'otsu' or 'triangle'
+            If int then it is the threshold pixel value above which pixels are
+            replaces by neighbourhood value. If False then thresh is
+            calculated from quan (see below). If 'otsu' then thresholding is done
+            with cv.threshold using the cv.THRESH_OTSU method. If 'triangle' then
+            cv again but with cv.THRESH_TRIANGLE.
+        quan : float {0-1}
+            The quantile intensity value that is found to set the filter
+            threshold if thresh isn't provided.
+        kernThresh : int
+            The size of the kernel which defines the neighbourhood which
+            decides whether a pixel will be replaced.
+        kernRepl : int
+            The size of the kernel which defines the neighbourhood which
+            creates the replacement pixel value.
+        removeLargeHigh : bool or int
+            If not False then high intensity regions with a
+            connected-components area (in pixels) above this value will be
+            removed.
+        removeSmallHigh : bool or int
+            If not False then high intensity regions with a
+            connected-components area (in pixels) below this value will be
+            removed.
+        diagnose : bool
+            If True then it doesn't change the TData but instead returns some
+            images from various processing steps.
+        """
+
+        if isinstance(chan,str):
+            chan = self.Chan.index(chan)
+        dims = [self.NT,self.NF,self.NM,self.NZ]
+        ranges = map(range,dims)
+        for t,f,m,z in product(*ranges):
+            img = self.data[t,f,m,z,chan].copy()
+            if not thresh:
+                thresh2 = np.quantile(img,quan)
+            else:
+                thresh2 = thresh
+            kern1 = cv.getGaussianKernel(kernThresh,-1)
+            blur = cv.sepFilter2D(img,-1,kern1,kern1)
+            if isinstance(thresh2,str):
+                blur2 = genF.makeuint8(blur,1,0)
+                if thresh=='otsu':
+                    meth = cv.THRESH_BINARY+cv.THRESH_OTSU
+                elif thresh=='triangle':
+                    meth = cv.THRESH_BINARY+cv.THRESH_TRIANGLE
+                else:
+                    raise Exception('filterBrightObjects: unrecognised thresh string')
+                ret,replaceMask = cv.threshold(blur2,0,255,meth)
+            else:
+                replaceMask = (blur > thresh2)
+            replaceMask = replaceMask.astype('uint8')
+            if removeSmallHigh:
+                NComp,markers,stats,_ = cv.connectedComponentsWithStats(replaceMask)
+                for i in range(1,NComp):
+                    if stats[i,-1]<removeSmallHigh:
+                        markers[markers==i] = 0
+                markers[markers>0] = 1
+                replaceMask = markers.astype('uint8')
+            kernDil = np.ones((7,7),np.uint8)
+            replaceMask = cv.dilate(replaceMask,kernDil,iterations=1)
+            if removeLargeHigh:
+                NComp,markers,stats,_ = cv.connectedComponentsWithStats(replaceMask)
+                for i in range(1,NComp):
+                    if stats[i,-1]>removeLargeHigh:
+                        markers[markers==i] = 0
+                markers[markers>0] = 1
+                replaceMask = markers.astype('uint8')
+            replaceMask = replaceMask.astype('bool')
+
+            imHoles = blur.copy()
+            imHoles[replaceMask] = 0
+            rMaskNot = np.logical_not(replaceMask).astype('uint16')
+            sums = cv.boxFilter(imHoles,-1,(kernRepl,kernRepl),normalize=False)
+            Ns = cv.boxFilter(rMaskNot,-1,(kernRepl,kernRepl),normalize=False)
+
+            k2 = kernRepl
+            yKern = kernRepl
+            while np.any(Ns==0): # this grows the kernels until no blank spaces
+                k2 += 10
+                yKern += 2
+                sums2 = cv.boxFilter(imHoles,-1,(k2,yKern),normalize=False)
+                Ns2 = cv.boxFilter(rMaskNot,-1,(k2,yKern),normalize=False)
+                sums[Ns==0] = sums2[Ns==0]
+                Ns[Ns==0] = Ns2[Ns==0]
+            bigBlur = sums/Ns
+            if diagnose:
+                return [replaceMask,imHoles,bigBlur]
+            self.data[t,f,m,z,chan][replaceMask] = bigBlur[replaceMask]
+
 
 
     def zProject(self,
                  meth='maxProject',
-                 downscale=None,
+                 downscale=1,
                  slices=1,
-                 fur=False,
-                 chan=None,
+                 furthest=False,
+                 chan='all',
                  proj_best=True,
                  sliceBySlice=False,
                  meth_fun=signalF,
-                 *args,
-                 verbose=False):
+                 verbose=False,
+                 **kwargs,):
         """
         This does z-projection of the data.
 
@@ -4211,18 +5168,20 @@ class TData:
             Or it can do a fancy one that finds the layer with most features.
         downscale : int
             Just used if meth=signalDetect - how much to downscale the images
-            by when calculating which slices have signal... svaes lots of time.
+            by when calculating which slices have signal... saves lots of time.
         slices : int
             How many slices to return in the signalDetect method.
-        fur : bool
+        furthest : bool
             Whether to return the slice furthest from the signal (e.g. for
             pulling out a background measure).
         chan : str or int
-            For signalProject this calculates the slices based on just the
-            channel you give here. You can give as the channel name or the
-            index in stack. If None then all are calculated separately, but 
-            remember not to put False because it will interpret this as the 
-            integer 0 because python is broken like that.
+            For signalProject this calculates the slices based on just the 
+            channel you give here. Provide as anything accepted by 
+            parseTFMZC(). If None then all are calculated separately - note 
+            how this can lead to a final image where the images from different 
+            channels come from different z-slices.Remember not to put False 
+            because it will interpret this as the integer 0 because python is 
+            broken like that.
         proj_best : bool
             In signal detect version, whether to do a final average projection 
             once you have done your signal projection.
@@ -4234,7 +5193,7 @@ class TData:
         meth_fun : python function
             Function to pass to measure 'signal' (would be better called 
             sharpness) in image if using signalDetect method.
-        *args : variable
+        **kwargs : variable
             Arguments to pass to meth_fun
 
         Example
@@ -4254,6 +5213,9 @@ class TData:
         """
 
         if np.prod(np.array(self.Shape))==0 or self.NZ==1:
+            self.data = np.max(self.data,axis=3,keepdims=True)
+            self.updateDimensions()
+            self.SeshZ = [None]
             return
         dims = [self.NT,self.NF,self.NM,1,self.NC,self.NY,self.NX]
         if slices!=1:
@@ -4263,31 +5225,28 @@ class TData:
 
         ranges = map(range,[self.NT,self.NF,self.NM,self.NC])
         ranges2 = map(range,[self.NT,self.NF,self.NM])
-        # method1: maximum projection
         if meth == 'maxProject':
             for t,f,m,c in product(*ranges):
                 _data[t,f,m,0,c] = maxProj(self.data[t,f,m,:,c])
-        # method2: the signal detection one I made:
         elif meth == 'signalDetect':
-            assert isinstance(downscale,int),EM.zp1
             p = self.pixSizeX
+            
             if isinstance(chan,int) or isinstance(chan,str):
-                if isinstance(chan,str):
-                    chan = self.Chan.index(chan)
+                chan = self.parseTFMZC(C=chan)[4][0]
                 for t,f,m in product(*ranges2):
                     stack2 = findSliceSelection(self.data[t,f,m,:,chan],
                                                 p,
                                                 downscale,
-                                                fur,
+                                                furthest,
                                                 sliceBySlice,
                                                 meth_fun,
-                                                *args)
+                                                **kwargs)
                     for c in range(self.NC):
                         _data[t,f,m,:,c] = takeSlicesSelection(stack2,
-                                                               self.data[t,f,m,:,c],
-                                                               slices,
-                                                               proj=proj_best,
-                                                               sliceBySlice=sliceBySlice)
+                                                    self.data[t,f,m,:,c],
+                                                    slices,
+                                                    proj=proj_best,
+                                                    sliceBySlice=sliceBySlice)
             else:
                 for t,f,m,c in product(*ranges):
                     _data[t,f,m,:,c] = signalProj(self.data[t,f,m,:,c],
@@ -4295,10 +5254,10 @@ class TData:
                                                   downscale,
                                                   slices,
                                                   proj_best,
-                                                  fur,
+                                                  furthest,
                                                   sliceBySlice,
                                                   meth_fun,
-                                                  *args)
+                                                  **kwargs)
         elif meth == 'avProject':
             for t,f,m,c in product(*ranges):
                 _data[t,f,m,0,c] = avProj(self.data[t,f,m,:,c])
@@ -5317,8 +6276,8 @@ class TData:
             The channel than needs to be realigned. You can provide as channel 
             index or name.
         """
-        badChan = self.chan_index(badChan)
-        goodChan = self.chan_index(goodChan)        
+        _,_,_,_,badChan = self.parseTFMZC(C=badChan)
+        _,_,_,_,goodChan = self.parseTFMZC(C=goodChan)
             
         ranges = [range(self.NT),range(self.NF),range(self.NM),range(self.NZ)]
         
@@ -5486,7 +6445,7 @@ class TData:
             else:
                 analPath = os.path.join(self.ParentXFold.XPathP,outDir)
         else:
-            raise Exception('You must provide an outDir.')
+            raise Exception('You must provide an outDir string.')
 
         if not os.path.exists(analPath):
             os.makedirs(analPath)
@@ -5506,8 +6465,12 @@ class TData:
             # only add channel tag if your tdata is not all of the session chan
             if not all([c in self.Chan for c in self.ParentSession.Chan2]):
                 chanTag = '_C'
-                for c in self.Chan:
-                    chanTag += '_Ch' + c
+                # tw 18/6/25 changing this is a rush:
+                # the previous way (commented) had a problem that tagging with letters can lead to the sorted file list chaning the channel order. The the order of self.Chan doesn't match. I tested this way and it seems to work
+                #for c in self.Chan:
+                    
+                    #chanTag += '_Ch' + c
+                chanTag += '_Ch' + str(self.SeshC[0]).zfill(4)
                     
             if self.SeshM[0]:
                 mTag = '_m' + str(self.SeshM[0]).zfill(4)
@@ -5725,14 +6688,26 @@ class TData:
         self.newSeshNX = self.NX  
 
     
-    def Clip(self,maxV):
+    def Clip(self,maxV,C='all'):
         """
         very simple method to just clip pixel intensities according to max.
         Needed because ExtractProfileRectangle needs the mask outline you draw
         to be the maximum pixel value in the image and that can be annoying
         for images with overexposed regions or random high pixels.
+
+        Parameters
+        ----------
+        maxV : int
+            All pixels above this value will be set to this value.
+        C : int or str
+            The channel(s) you apply Clip to. Accepts any of the normal input 
+            formats (see parseTFMCZ()).
         """
-        self.data[self.data>maxV] = maxV
+
+        _,_,_,_,C = self.parseTFMZC(C=C)
+        
+        for c in C:
+            self.data[:,:,:,:,c][self.data[:,:,:,:,c]>maxV] = maxV
 
 
     def AsDType(self,dtype,low_percentile,high_percentile):
@@ -5755,7 +6730,7 @@ class TData:
         It treats channels individually but everything else it caluclates in 
         one go, i.e. with just one lower and upper pixel value.
         """
-
+        
         new_data = np.zeros(self.Shape,dtype=dtype)
         
         for c in range(self.NC):
@@ -5781,6 +6756,239 @@ class TData:
 
         self.data = new_data.copy()
                
+
+
+    def ExtractProfileRectangle(self,
+                                outDir=False,
+                                windows=None,
+                                masks=None,
+                                NXSegs=10,
+                                downsizeY=2,
+                                overwrite=False,
+                                returnData=False,
+                                normIm=False,
+                                cropTData=False
+                               ):
+        """
+        This saves csvs containing averaged pixel values taken from the
+        gradient windows. I.e. if you want pixel intensites but saving a csv
+        of all pixels is be too large then do averaging with this.
+
+        Parameters
+        ----------
+        outDir : str
+            Name of directory to save csvs too. It is in the parent directory
+            of XPath. This directory will be created if needed. If False then 
+            it won't save anything.
+        windows : str or None
+            This defines the rectangular region from which measurements are
+            taken. Draw the rectangle with rectangle tool in image j and save
+            coordinates as .txt file. Remember to draw it on an image which
+            has been treated exactly the same as the TData that you use this
+            method on. It should be a string to the folder containing all such
+            .txt files. They should be separated into directories named
+            'Exp'+FieldID. If str is a level 0 path then it assumes the
+            directory with this name is in the parent directory of the XFold.
+            If None then it takes everything. A trapezium shaped window will be
+            converted to the bounding rectangle.
+        masks : str or None or array-like
+            This is an image which defines a region of arbitrary shape to
+            decide which pixels to include (used in combination with windows).
+            This image should have the usable region outlined with the highest
+            pixel intensity of the image. Input as windows.
+        NXSegs : int
+            The number of segments to return along the x-axis. All pixel
+            values are averaged within each segment. The X position in pixels
+            of the middle of each segment will be given in the CSV row heading
+            (measured relative to the window).
+        downsizeY : int
+            Factor to downsize y-axis length by. Pixels are averaged. Position
+            put in CSV headings too.
+        overwrite : bool
+            Whether to allow csvs to be overwritten
+        returnData : bool
+            If True then it will return the extracted values. See Returns below.
+        normIm : bool or array-like
+            If not False then an image to divide your image through by before 
+            extracting the data.
+
+        Returns
+        -------
+        If returnData=False then nothing returned but csvs are saved. The csvs
+        have NSegs+1 columns and 1+NY//downsizeY rows. One separate csv for
+        each T,F,M,Z,C.
+
+        If returnData=True then it returns: (outList,ypos,xpos,outIms,outMasks).
+        outList : list of numpy arrays
+            Shape is (NT,NM,NZ,NC,ny,nx) where ny,nx are the number of
+            measures taken along y and x. Each element corresponds to a field
+            in self.
+        ypos,xpos : lists of lists.
+            Each inner list corresponds to a field in self. Then these are the
+            positions (in pixels) of the measures in dataList within the 
+            gradient window.
+        outIms : list of numpy arrays
+            Your image data but just the cropped window where the measure was 
+            taken. One array in list for each field.
+        outMasks : list of numpy arrays
+            The masks used in data extraction, but just the cropped window so 
+            it matches imageWindow.
+        cropTData : bool
+            Whether to crop your TData image data to the window. You can only 
+            do this if you only have one field in the TData, otherwise 
+            different fields with different sized windows could lead to jagged 
+            numpy arrays. (see ToDos)
+
+        ToDos
+        -----
+        Should allow cropTData in NF>1 in cases where the window sizes are the 
+        same. 
+        """
+
+        if cropTData:
+            assert self.NF==1,'TData must have NF==1 when cropTData=True'
+
+        # don't want to include label channel in future loops
+        CC = [i for i,c in enumerate(self.Chan) if c!='Label']
+
+
+        # this collects out data if you are returning it.
+        # one element for each field since they may have differnt dimensions
+        if returnData:
+            outList = []
+            xpos = []
+            ypos = []
+            outIms = []
+            outMasks = []
+
+        for i,FID in enumerate(self.FieldIDs):
+
+            if isinstance(NXSegs,dict):
+                NXSegsF = NXSegs[FID]
+            else:
+                NXSegsF = NXSegs
+            # will need to know padding applied to self.data wrt to templates
+            if FID in self.TemplatePadDic.keys():
+                pd = self.TemplatePadDic[FID]
+            else:
+                pd = [0,0]
+
+            # import and process the window into form [[y0,x0]...[y3,x3]]
+            if windows == None:
+                win = [[pd[0]//2,pd[1]//2],
+                       [pd[0]//2,self.NX-math.ceil(pd[1]/2)],
+                       # here changed pd[1] to pd[0], problems?:
+                       [self.NY-math.ceil(pd[0]/2),self.NX-math.ceil(pd[1]/2)],     
+                       [self.NY-math.ceil(pd[0]/2),pd[1]//2]]
+            else:
+                self.ParentXFold.buildWindows(windows)
+                if FID in list(self.ParentXFold.WindowDic[windows].keys()):
+                    win = self.ParentXFold.WindowDic[windows][FID]
+                else:
+                    raise Exception('Window not found for field '+FID)
+                # apply pad to window if TData was extracted from same template
+                win = [[a+b//2 for a,b in zip(v,pd)] for v in win]
+            yi,yf,xi,xf = [win[0][0],win[2][0],win[0][1],win[2][1]]
+
+            # similarly import the mask
+            if masks is None:
+                mask = np.ones((self.NY,self.NX)).astype('int')
+            elif isinstance(masks,str):
+                self.ParentXFold.buildMasks(masks)
+                mask = self.ParentXFold.MaskDic[masks][FID]
+                pad1 = [[p//2,math.ceil(p/2)] for p in pd]
+                mask = np.pad(mask,pad1).astype('int')
+            elif isinstance(masks,np.ndarray):
+                mask = masks
+            else:
+                raise Exception('masks provided in uknown format')
+            # extract window from mask
+            mask = mask[yi:yf,xi:xf].copy()
+
+            dy = downsizeY
+            NY = int((yf-yi)/dy)
+            dx = int((xf-xi)/NXSegsF)
+
+            if returnData:
+                outData = np.zeros((self.NT,self.NM,self.NZ,len(CC),NY,NXSegsF))
+                outIm = np.zeros((self.NT,self.NM,self.NZ,len(CC),yf-yi,xf-xi))
+            elif cropTData:
+                outIm = np.zeros((self.NT,self.NM,self.NZ,len(CC),yf-yi,xf-xi))
+
+            # process separately for T,M,Z,chan
+            ranges = [range(self.NT),range(self.NM),range(self.NZ),CC]
+            for t,m,z,c in product(*ranges):
+                # extract window of data from self:
+                data = self.data[t,i,m,z,c,yi:yf,xi:xf].copy()
+                    
+                if isinstance(normIm,np.ndarray):
+                    normIm2 = normIm[yi:yf,xi:xf].copy()
+                    data = data.astype('float32')/normIm2
+                # initiate np array and steps for collecting data
+                _csv = np.zeros((NY,NXSegsF))
+                for y in range(NY):
+                    for x in range(NXSegsF):
+                        # input the data
+                        blockD = data[y*dy:(y+1)*dy,x*dx:(x+1)*dx].copy()
+                        blockM = mask[y*dy:(y+1)*dy,x*dx:(x+1)*dx].copy()
+                        result = blockD[blockM==1]
+                        if result.size==0:
+                            _csv[y,x] = 'NaN'
+                        else:
+                            _csv[y,x] = np.mean(result)
+                        del blockD
+                        del blockM
+                
+                # add x-slice and y-distance headings
+                xlab = [str(dx*x+dx//2) for x in range(NXSegsF)]
+                xlab = np.array(['x='+x+' pixels' for x in xlab])
+                ylab = ['y='+str(dy*y+dy//2)+'pixels' for y in range(NY)]
+                ylab = np.array(['Y distance']+ylab)
+                _csv = np.vstack((xlab,_csv))
+                _csv = np.hstack((ylab.reshape((NY+1,1)),_csv))
+
+                if returnData:
+                    outData[t,m,z,c] = _csv[1:,1:]
+                    outIm[t,m,z,c] = data.copy()
+                elif cropTData:
+                    outIm[t,m,z,c] = data.copy()
+                del data
+
+                if outDir:
+                    outName ='T'+str(self.Times[FID][t])+'min_M'+str(m)+'_Z'
+                    outName += str(z)+'_C'+self.Chan[c]+'.csv'
+                    outF = defs.FieldDir + FID
+                    outPath1 = os.path.join(self.ParentXFold.XPathP,outDir,outF)
+                    if not os.path.exists(outPath1):
+                        os.makedirs(outPath1)
+                    outPath = os.path.join(outPath1,outName)
+                    if not overwrite:
+                        assert not os.path.exists(outPath),EM.ae5
+
+                    # 10/24 changed this to pandas to avoid csv import
+                    #with open(outPath,'w',newline='') as file:
+                    #    writer = csv.writer(file)
+                    #    writer.writerows(_csv)
+                    pd.DataFrame(_csv).to_csv(outPath)
+                        
+            if returnData:
+                outList.append(outData)
+                xp = [dx*x+dx//2 for x in range(NXSegsF)]
+                xpos.append(xp)
+                yp = [dy*y+dy//2 for y in range(NY)]
+                ypos.append(yp)
+                outIms.append(outIm)
+                outMasks.append(mask)
+            elif cropTData:
+                outIms.append(outIm)
+            del outIm
+
+        if cropTData:
+            self.data = np.expand_dims(outIms[0],axis=1).copy()
+            self.updateDimensions()
+        if returnData:
+            return (outList,ypos,xpos,outIms,outMasks)
+        print('Warning: we havent updated self.newSeshNQ in this function yet so saving and reloading might have troubles.')
 
         
     def ExtractRings(self,
@@ -6068,28 +7276,31 @@ class TData:
 
     
     def Segment(self,
-                C,
+                seg_chan,
                 mask=False,
                 returnSigNoise=False,
-                oldOutput=True,
                 maskOutput=False,
                 method=False,
-                erodeMask=False,
-                blur_sig=False,
-                addSeg2TData=False,
-                returnSegmentations=True,
+                erodeMask=None,
+                blur_sig=None,
+                clip_sig=None,      
+                watershed_label=None,
+                addSeg2TData='auto',
                 closing=None,
                 removeSmall=None,
-                clearBorder=False):
+                clearBorder=False,
+                saveSegmentationsAndDelete=None,       
+                compress=False, 
+                verbose=False
+               ):
         """
         Returns a mask of the segmented image using cv.threshold().
         
         Parameters
         ----------
-        C : int or str
-            The channel you will segment, either as its index in tdata.Chan 
-            or the name of the channel.
-        mask : str or False or array-like
+        seg_chan : {int,str}
+            The channel index or name you want to segment.
+        mask : {str,False,array-like}
             This is an image which defines a region of arbitrary shape to
             decide which pixels to include in the calculation of threshold. It 
             can be input as a string to indicate a template-matched mask (see 
@@ -6097,29 +7308,32 @@ class TData:
         returnSigNoise : bool
             Whether to return the eroded and dilated-inverted masks for 
             definite signal and definite noise.
-        oldOutput : bool
-            Whether to save masks in the old output format. Or new way like 
-            self.Cellpose.
         maskOutput : bool
             Whether to use the original mask to restrict the area of returned 
             masks. I.e. the mask is intially used to restrict area taken into 
             account for the threshold calculation, whereas this controls 
             whether regions outside that mask appear at all in the returned 
             masks.
-        method : bool or cv parameter.
+        method : {bool,cv parameter}
             Default is to use otsu. Put cv.THRESH_TRIANGLE to try that method.
         erodeMask : bool or ints
             If int then it will erode the first mask to stop side edge pixels 
             being taken into account in the threshold calculation.
         blur_sig : int or False
-            Sometimes useful to blur the image a bit before segmentation 
-            because cell pose does too detailed segmentation for high 
-            resolution images. 
-        addSeg2TData : bool
-            If True then the calculated masks will be added as a new channel 
-            to the TData.            
-        returnSegmentations : bool
-            Whether to return the calculated segmentation masks.   
+            Sometimes useful to blur the image a bit before segmentation.
+        clip_sig : {None,int,float}
+            Sometimes useful to clip the image a bit before segmentation. If 
+            this is an int then all pixels above this value will be set to 
+            this value.
+        watershed_label : {None,int,float}
+            If not None it will label the masks using watershed with peaks 
+            found over a footprint of the size you specify, in um. 
+        addSeg2TData : {str,False}
+            If a str then the calculated masks will be added as a new channel 
+            to the TData. If 'auto' then an automatic Chan2 name will be 
+            created based on segmentation parameters, otherwise your specified 
+            string will be used (after passing through 
+            self.parseSegNameToChan2().          
         closing : None or int
             The rectangular kernel size of the morphological opening if you 
             chose to do it.
@@ -6127,99 +7341,127 @@ class TData:
             Remove objects with area smaller than this (in pixels).
         clearBorder : bool
             Whether to clear the segmentation mask border.
-            
-        Returns
-        -------
-        If oldOutput==True:
-        segs : list of numpy array-like or list of lists of array-like
-            The segmented images, one for each field. If return sigNoise then 
-            each element is the list [seg,sig,noise].
+        saveSegmentationsAndDelete : None or str
+            Whether to save the segmentation masks. Str will be the name of 
+            the folder they are saved into. This deletes everything except for 
+            the segmentation just before saving because SaveData doesn't yet 
+            have one channel only.     
+        compress : bool
+            Whether the saved files should be compressed or not.            
             
         Notes
         -----
         Currently only works for tdata with NQ=1 for Q=T,M,Z.
         """
 
-        _,_,_,_,C = self.parseTFMZC(C=C)
+        _,_,_,_,seg_chan = self.parseTFMZC(C=seg_chan)
+        seg_chan = seg_chan[0]
 
         if isinstance(mask,str):
             self.ParentXFold.buildMasks(mask)            
             
-        segs = []
-        for i,FID in enumerate(self.FieldIDs):
-            
-            # take the required bit of the image
-            seg = self.data[0,i,0,0,C].copy()
-            if isinstance(blur_sig,int):
-                seg = filters.gaussian(seg,
-                                         sigma=blur_sig,
-                                         preserve_range=True).astype('uint16')            
-            seg = tu.makeuint8(seg,1,0)            
-            
-            # build the mask
-            if not mask:
-                mask = np.ones(seg.shape)  
-                mask3 = mask.copy()
-            elif isinstance(mask,str):
-                # need to know padding applied to self.data wrt to templates
-                if FID in self.TemplatePadDic.keys():
-                    pd = self.TemplatePadDic[FID]
+        segs = np.zeros((self.NT,self.NF,self.NM,self.NZ,1,self.NY,self.NX),dtype='uint16')
+        dims = [self.NT,self.NM,self.NZ]
+        ranges = map(range,dims)
+        for t,m,z in product(*ranges):        
+            for i,FID in enumerate(self.FieldIDs):
+                if verbose:
+                    print('f:',i,' t:',t,' m:',m,' z:',z)
+                
+                # take the required bit of the image
+                seg = self.data[t,i,m,z,seg_chan].copy()
+                
+                if isinstance(blur_sig,int):
+                    seg = filters.gaussian(seg,
+                                             sigma=blur_sig,
+                                             preserve_range=True).astype('uint16') 
+                    
+                if isinstance(clip_sig,(int,float)):
+                    seg[seg>clip_sig] = clip_sig
+                    
+                seg = tu.makeuint8(seg,1,0)     
+                
+                # build the mask
+                if not mask:
+                    mask1 = np.ones(seg.shape)  
+                    mask3 = mask1.copy()
+                elif isinstance(mask,str):
+                    # need to know padding applied to self.data wrt to templates
+                    if FID in self.TemplatePadDic.keys():
+                        pd = self.TemplatePadDic[FID]
+                    else:
+                        pd = [0,0]                
+                    mask1 = self.ParentXFold.MaskDic[mask1][FID]
+                    pad1 = [[p//2,math.ceil(p/2)] for p in pd]
+                    mask1 = np.pad(mask1,pad1).astype('int16')     
+                    mask3 = mask1.copy()
+                    if erodeMask:
+                        kernel2 = np.ones((erodeMask,erodeMask),np.uint8)
+                        mask3 = cv.erode(mask3,kernel2)
+                
+                mask1 = mask1.copy().astype('bool')
+                mask3 = mask3.copy().astype('bool')
+                
+                # threshold the chosen channel, only in mask region
+                if not method:
+                    thr_param = cv.THRESH_BINARY+cv.THRESH_OTSU
                 else:
-                    pd = [0,0]                
-                mask = self.ParentXFold.MaskDic[mask][FID]
-                pad1 = [[p//2,math.ceil(p/2)] for p in pd]
-                mask = np.pad(mask,pad1).astype('int16')     
-                mask3 = mask.copy()
-                if erodeMask:
-                    kernel2 = np.ones((erodeMask,erodeMask),np.uint8)
-                    mask3 = cv.erode(mask3,kernel2)
-            
-            mask = mask.copy().astype('bool')
-            mask3 = mask3.copy().astype('bool')
-            
-            # threshold the chosen channel, only in mask region
-            if not method:
-                thr_param = cv.THRESH_BINARY+cv.THRESH_OTSU
-            else:
-                thr_param = cv.THRESH_BINARY+method
-            ret,_ = cv.threshold(seg[mask3],0,255,thr_param)
-            seg[seg<ret] = 0
-            seg[seg>=ret] = 1
-            
-            if returnSigNoise:
-                # nuclei and noise masks
-                kernel = np.ones((3,3),np.uint8)
-                sig = cv.erode(seg,kernel)
-                noise = 1-cv.dilate(seg,kernel)
-                if maskOutput:
-                    mask2 = cv.erode(mask.astype('uint16'),kernel)
-                    seg = np.logical_and(seg,mask2)
-                    sig = np.logical_and(sig,mask2)
-                    noise = np.logical_and(noise,mask2)  
-                seg = [seg,sig,noise]
-            elif maskOutput:
-                seg = np.logical_and(seg,mask.astype('uint16'))
-            if closing:
-                kern = cv.getStructuringElement(cv.MORPH_ELLIPSE,(closing,closing))
-                seg = cv.morphologyEx(seg, cv.MORPH_CLOSE, kern)
-            if removeSmall:
-                seg = remove_small_objects(seg.astype('bool'), min_size=removeSmall, connectivity=1)
-            if clearBorder:
-                seg = clear_border(seg)                
-            
-            segs.append(seg)
+                    thr_param = cv.THRESH_BINARY+method
+                ret,_ = cv.threshold(seg[mask3],0,255,thr_param)
+                
+                seg[seg<ret] = 0
+                seg[seg>=ret] = 1
+                
+                if returnSigNoise:
+                    # nuclei and noise masks
+                    kernel = np.ones((3,3),np.uint8)
+                    sig = cv.erode(seg,kernel)
+                    noise = 1-cv.dilate(seg,kernel)
+                    if maskOutput:
+                        mask2 = cv.erode(mask1.astype('uint16'),kernel)
+                        seg = np.logical_and(seg,mask2)
+                        sig = np.logical_and(sig,mask2)
+                        noise = np.logical_and(noise,mask2)  
+                    seg = [seg,sig,noise]
+                elif maskOutput:
+                    seg = np.logical_and(seg,mask1.astype('uint16'))
+                if closing:
+                    kern = cv.getStructuringElement(cv.MORPH_ELLIPSE,(closing,closing))
+                    seg = cv.morphologyEx(seg, cv.MORPH_CLOSE, kern)
+                if removeSmall:
+                    seg = remove_small_objects(seg.astype('bool'), min_size=removeSmall, connectivity=1)
+                if clearBorder:
+                    seg = clear_border(seg)    
+                    
+                if watershed_label:
+                    foot_size = int(self.um_2_pixels(watershed_label))
+                    dist_seg = distance_transform_edt(seg)
+                    coords_seg = peak_local_max(dist_seg,
+                                                footprint=np.ones((foot_size,
+                                                                   foot_size)),
+                                                labels=seg)
+                    mask_seg = np.zeros(dist_seg.shape, dtype=bool)
+                    mask_seg[tuple(coords_seg.T)] = True
+                    markers_seg, _ = label(mask_seg)
+                    seg = watershed(-dist_seg, markers_seg, mask=seg)
+                
+                segs[t,i,m,z,0] = seg
 
-        if not oldOutput:
-            segsArray = np.zeros((self.NT,self.NF,self.NM,self.NZ,self.NY,self.NX),dtype='uint16')
-            for i,seg in enumerate(segs):
-                segsArray[:,i,:,:] = seg
-            
         if addSeg2TData:
-            assert not oldOutput,'set oldOutput==False for addSeg2TData'
-            self.AddArray(segsArray[:,:,:,:,np.newaxis,:,:],'Segmentation')     
+            assert isinstance(addSeg2TData,str),EM.seg1
+            if addSeg2TData=='auto':
+                chan2_name = 'Segmentation_'
+                chan2_name += self.Chan2[seg_chan] + '_BasicSegment'
+            else:
+                chan2_name = self.parseSegNameToChan2(addSeg2TData)
+            self.AddArray(segs,chan2_name)
 
-        if returnSegmentations:
-            return segs
+        if saveSegmentationsAndDelete:
+            rand_name = str(random.randint(0,1000000))
+            self.AddArray(segs,'Segmentation_'+rand_name)
+            self.TakeSubStack(C='Segmentation_'+rand_name,updateNewSeshNQ=True)
+            self.SaveData(saveSegmentationsAndDelete,compress=compress)   
+
    
         
     def Cellpose(self,
@@ -6233,7 +7475,7 @@ class TData:
                  blur_sig=None,
                  clear_borderQ=False,
                  remove_small=None,
-                 addSeg2TData=True,
+                 addSeg2TData='auto',
                  saveSegmentationsAndDelete=None,                 
                  printWarnings=True,
                  verbose=False,
@@ -6249,17 +7491,17 @@ class TData:
 
         Parameters
         ----------
-        diameter : float or array of floats
+        diameter : {float,array of floats}
             The diameter of the thing being segmented in um. If array then the 
             shape must match the shape of the array minus the last 2 'XY' 
             dimensions.
-        seg_chan : int or str
+        seg_chan : {int,str}
             The channel index or name you want to segment.
         nuc_chan : int or str
             If you are doing a cytoplasm segmentation you can also 
             provide a nucleus channel to help. Leave this as None if you don't 
             have one.
-        model_type : 'cyto' or 'nuclei' or 'cyto3'
+        model_type : {'cyto','nuclei','cyto3'}
             ...
         flow_threshold : float
             A parameter in the segmentation algorithm. Increase to get more 
@@ -6267,7 +7509,7 @@ class TData:
         cellprob_threshold : float
             A parameter in the segmentation algorithm. Decrease to get more 
             masks. It seems like this should be varied in the range -6 to 6.
-        normalise : 'auto' or bool or float or int
+        normalise : {'auto',bool,float,int}
             I noticed a problem with cellpose normalisation (bug raised on 
             github 4/11/24). They do normalisation to 0=1st percentile and 
             1=99th percentile but don't do clipping. This results in bad 
@@ -6279,22 +7521,25 @@ class TData:
             percentiles X/2 and 100 - X/2 instead of 1st and 99th. Or put True 
             or False to use cellpose normalisation or no normalisation. Or put 
             an int or float to control what percentile is used in 'auto'.
-        blur_sig : int or False
+        blur_sig : {int,False}
             Sometimes useful to blur the image a bit before segmentation 
             because cellpose does too detailed segmentation for high 
             resolution images.
         clear_borderQ : bool
             Whether to remover the objects in the output labelled which 
             are connected to the border.
-        remove_small : None or int or 'auto'
+        remove_small : {None,int,'auto'}
             If int then remove mask objects that have an area smaller than 
             this in um^2. If 'auto' then it removes objects with an effective 
             diameter more than 4 times smaller than the diameter you have 
             provided to cellpose.            
-        addSeg2TData : bool
-            If True then the calculated masks will be added as a new channel 
-            to the TData.
-        saveSegmentationsAndDelete : None or str
+        addSeg2TData : {str,False}
+            If a str then the calculated masks will be added as a new channel 
+            to the TData. If 'auto' then an automatic Chan2 name will be 
+            created based on segmentation parameters, otherwise your specified 
+            string will be used (after passing through 
+            self.parseSegNameToChan2().
+        saveSegmentationsAndDelete : {None,str}
             Whether to save the segmentation masks. Str will be the name of 
             the folder they are saved into. This deletes everything except for 
             the segmentation just before saving because SaveData doesn't yet 
@@ -6386,16 +7631,23 @@ class TData:
             if remove_small:
                 masks[t,f,m,z] = remove_small_objects(masks[t,f,m,z],remove_small)
                 
-        if addSeg2TData or saveSegmentationsAndDelete:
-            chan2_name = 'Segmentation_'
-            chan2_name += self.Chan2[seg_chan] + '_'
-            chan2_name += model_type + '_'
-            if isinstance(diameter,float) or isinstance(diameter,int):
-                chan2_name += 'D' + str(diameter).replace('.','p')
+        if addSeg2TData:
+            assert isinstance(addSeg2TData,str),EM.seg1
+            if addSeg2TData=='auto':
+                chan2_name = 'Segmentation_'
+                chan2_name += self.Chan2[seg_chan] + '_'
+                chan2_name += model_type + '_'
+                if isinstance(diameter,float) or isinstance(diameter,int):
+                    chan2_name += 'D' + str(diameter).replace('.','p')
+            else:
+                chan2_name = self.parseSegNameToChan2(addSeg2TData)
+                
             self.AddArray(masks[:,:,:,:,np.newaxis,:,:],chan2_name)
 
         if saveSegmentationsAndDelete:
-            self.TakeSubStack(C='Segmentation',updateNewSeshNQ=True)
+            rand_name = str(random.randint(0,1000000))
+            self.AddArray(masks[:,:,:,:,np.newaxis,:,:],'Segmentation_'+rand_name)
+            self.TakeSubStack(C='Segmentation_'+rand_name,updateNewSeshNQ=True)
             self.SaveData(saveSegmentationsAndDelete,compress=compress)            
 
     
@@ -6406,7 +7658,7 @@ class TData:
                  sam_predictor=None,
                  DEVICE=None,
                  clear_borderQ=False,
-                 addSeg2TData=True,
+                 addSeg2TData='auto',
                  printWarnings=True):
         """
         This uses a combination of YOLO and SAM to segment the channel you 
@@ -6420,7 +7672,7 @@ class TData:
 
         Parameters
         ----------
-        diameter : float or array of floats
+        diameter : {float,array of floats}
             The diameter of the thing being segmented in um. If array then the 
             shape must match the shape of the array minus the last 2 'XY' 
             dimensions.
@@ -6431,9 +7683,12 @@ class TData:
         clear_borderQ : bool
             Whether to remover the objects in the output labelled which 
             are connected to the border.
-        addSeg2TData : bool
-            If True then the calculated masks will be added as a new channel 
-            to the TData.
+        addSeg2TData : {str,False}
+            If a str then the calculated masks will be added as a new channel 
+            to the TData. If 'auto' then an automatic Chan2 name will be 
+            created based on segmentation parameters, otherwise your specified 
+            string will be used (after passing through 
+            self.parseSegNameToChan2().
         printWarnings : bool
             Just lets you turn off warnings if they get annoying.
             
@@ -6462,7 +7717,7 @@ class TData:
             sam_model = sam_model_registry[SAM_MODEL_TYPE](checkpoint=SAM_CKPT).to(device=DEVICE) 
             sam_predictor = SamPredictor(sam_model)                     
 
-        CLIP = [1, 99]    
+        CLIP = [1,99]    
         # Parameters
         AUGMENT = False
         CONF = 0.05
@@ -6555,8 +7810,17 @@ class TData:
         masks = masks > 0       
         
         if addSeg2TData:
-            self.AddArray(masks[:,:,:,:,np.newaxis,:,:],'Segmentation')
-            
+            assert isinstance(addSeg2TData,str),EM.seg1
+            if addSeg2TData=='auto':
+                chan2_name = 'Segmentation_YOLOSAM'
+                chan2_name += self.Chan2[nuc_chan] + '_'
+                if isinstance(diameter,float) or isinstance(diameter,int):
+                    chan2_name += 'D' + str(diameter).replace('.','p')
+            else:
+                chan2_name = self.parseSegNameToChan2(addSeg2TData)
+                
+            self.AddArray(masks[:,:,:,:,np.newaxis,:,:],chan2_name)
+
 
 
     
@@ -6702,7 +7966,7 @@ class TData:
              plotSegMask2=None,
              region=False,
              plotSize=10,
-             colouriseMask=False):
+             colouriseMask=True):
         """
         This plots the data with interactive sliders. So far only plots 4 
         channels.
@@ -6883,6 +8147,10 @@ class TData:
                 name += '_C3'        
             if checkboxC4.value:
                 name += '_C4'        
+            if ChSegMc.value:
+                name += '_Seg1'        
+            if ChSegMc2.value:
+                name += '_Seg2'                        
             plot_ax123.figure.savefig('./'+name+'.png')
         
         save_button = widgets.Button(description="Save Image")
@@ -7013,7 +8281,7 @@ class TData:
                     F,
                     M,
                     Z,
-                    self.chan_index('Segmentation'),
+                    self.parseTFMZC(C='Segmentation')[4][0],
                     yi:yf,
                     xi:xf].copy().astype('uint16')
                 else:
@@ -7059,7 +8327,7 @@ class TData:
                     segCol = 'RGB'
                 else:
                     segIm2[segIm2!=0] = 255
-                    segCol = 'Yellow'
+                    segCol = 'Cyan'
                 segIm2 = (segIm2*seg_alpha2).astype('uint16')
                 overlay_image = genF.combine_images(overlay_image,
                                                     segIm2,
@@ -7149,84 +8417,6 @@ class TData:
                                             'colour4':col_dropC4})
         
         display(widgets_box,output)
-    
-    
-    def chan_string_index(self,ch):
-        """
-        Provide one string and it returns the channel index of this channel in 
-        your tdata if it can find it. Error otherwise.
-        
-        It first checks if there are any 
-        channel names that match in the raw channel name, i.e. self.Chan2. 
-        Then it will check if the regularised version of your entry matches 
-        any of the regularised channel names in self.Chan (regularisation is 
-        done with generalFunctions.chanDic).  
-
-        ch : str
-            Your string name of channel you're looking for.
-        """
-        if ch in self.Chan2:
-            ch = self.Chan2.index(ch)
-        else:
-            ch2 = genF.chanDic(ch)
-            assert ch2 in self.Chan,'chan_index error: '+ch+'not in self.Chan'
-            ch = self.Chan.index(ch2)
-        return ch
-
-        
-    def chan_index(self,chans):
-        """
-        Give this a string channel name or list (or even list of list, see 
-        parameters) of channels and it returns the index/indices of the 
-        channel/s.
-
-        For channels provided as strings, it first checks if there are any 
-        channel names that match in the raw channel name, i.e. self.Chan2. 
-        Then it will check if the regularised version of your entry matches 
-        any of the regularised channel names in self.Chan (regularisation is 
-        done with generalFunctions.chanDic).
-
-        Parameters
-        ----------
-        chans : str or int or list of str or list of lists of str or int
-            If string then it returns the index of channel with that name. 
-            If list then it does that for a list of names. If list of list 
-            then each sublist is all names it searches for that channel 
-            and it returns the index of the first one that it finds. Note: 
-            behaviour of lists of lists not sorted w.r.t. Chan vs Chan2!
-        """ 
-        if isinstance(chans,str):
-            chans = self.chan_string_index(chans)
-        elif isinstance(chans,int):
-            pass
-        elif isinstance(chans,list):
-            intsQ = [isinstance(c,int) for c in chans]
-            stringsQ = [isinstance(c,str) for c in chans]
-            listsQ = [isinstance(c,list) for c in chans]
-            if all(intsQ):
-                return chans
-            if all(stringsQ):
-                chans = [self.chan_string_index(c) for c in chans]
-                if len(chans)==1:
-                    chans = chans[0]
-            elif all(listsQ):
-                chans2 = []
-                for chs in chans:
-                    inChanQ = [c in self.Chan for c in chs]
-                    assert any(inChanQ),'chan_index error: none of chan sublist found in self.Chan'
-                    for c in chs:
-                        assert isinstance(c,str), 'chan_index error: sublist not strings'
-                        if c in self.Chan:
-                            chans2.append(self.Chan.index(c))
-                            continue
-                if len(chans2)==1:
-                    chans2 = chans2[0]
-                chans = chans2            
-                        
-            else:
-                raise Exception('chan_index error: chans format not handled')
-
-        return chans
 
 
     def mergeTData(self,tdata2):
@@ -7336,7 +8526,6 @@ class TData:
         tdata2.newSeshNC = self.newSeshNC
         tdata2.newSeshNX = self.newSeshNX
         tdata2.newSeshNY = self.newSeshNY
-        
 
         return tdata2
 
@@ -7484,7 +8673,8 @@ class TData:
                     returnDF=True,
                     saveDF=False,
                     verbose=False,
-                    tracking=False):
+                    tracking=False,
+                    whole_image=False):
         """
         This takes the Segmentation channel of the TData and labels regions 
         and returns a pandas dataframe of measurements, a row for each region, 
@@ -7496,7 +8686,7 @@ class TData:
 
         Parameters
         ----------
-        Segmentation : str
+        Segmentation : {str,ms.XFold}
             This is the ONE channel to use for the first application of 
             regionProps, i.e. nothing to do with fun. Can be provided as Chan2 
             or Chan name and if it isn't found there it will attempt to load 
@@ -7558,6 +8748,9 @@ class TData:
             Whether to print t,f,m,z progress.
         tracking : bool
             See XFold.RegionProps
+        whole_image : bool
+            If True then it doesn't label the mask (and unlabels labelled 
+            masks), so the whole image/mask gets sent to regionprops.
             
         Returns
         -------
@@ -7641,7 +8834,7 @@ class TData:
             except ChannelException:
                 all_seg_chan.append(cmbc)
         for seg_chan in all_seg_chan:
-            self.LoadSegmentationChannel(seg_chan,'Segmentation_'+seg_chan)
+            self.LoadSegmentationChannel(seg_chan)
 
         _,_,_,_,cseg = self.parseTFMZC(C=Segmentation)
             
@@ -7661,10 +8854,18 @@ class TData:
             # that they correspond with other labelled segmentations, and this 
             # may order according to cells rather than that arbitrary order of 
             # appearance. So don't relabel if it is already labelled!
-            if genF.isLabelledMaskQ(seg):
-                label_img = seg.copy()
+            labelledQ = genF.isLabelledMaskQ(seg)
+            if labelledQ:
+                if whole_image: # then we need to unlabel
+                    label_img = seg.copy()
+                    label_img[label_img!=0] = 1
+                else:
+                    label_img = seg.copy()
             else:
-                label_img = measure.label(seg)
+                if whole_image:
+                    label_img = seg.copy()
+                else: # we need to label
+                    label_img = measure.label(seg)
             
             if len(np.unique(label_img))==1:
                 continue
@@ -7794,6 +8995,9 @@ class TData:
                   returnSegmentations=False,
                   returnThresholds=False):
         """
+        !! This is very similar to TData.Segment() but with some slightly 
+        different functionalities. The two should be merged !!!
+        
         This does simple thresholding of all tdata parts in the specified 
         channels. Either does all parts of each channel separately or all 
         together (i.e. one threshold value calculated), see one_thresh. 
@@ -7903,15 +9107,15 @@ class TData:
 
 
     def CleanMasks(self,
-                   C='Segmentation',
+                   Segmentation,
                    areaThreshold=None,
                    minAreaUnit='um^2',
                    circThreshold=None,
-                   clearBorder=False,    
+                   clearBorder=False, 
+                   removeSmallDisconnected=False,
                    editMasksInPlace=True,
                    addAsNewChannel=False,
                    saveSegmentationsAndDelete=None,                     
-                   printWarnings=True,
                    compress=True):
         """
         This removes border objects, objects smaller than a threshold area and 
@@ -7922,10 +9126,10 @@ class TData:
 
         Parameters
         ----------
-        C : {'all',int,list,str}
+        Segmentation : {'all',int,str,list,tuple,range,ms.XFold}
             The channel of a segmentation that you want to clean up. Accepts 
             in all normal formats (see parseTFMZC).
-        areaThreshold : None or int or float
+        areaThreshold : {None,int,float}
             If you want to remove objects smaller than a threshold then enter 
             it here. It is assumed to be in um^2.
         minAreaUnit : {'pixels','um^2'}
@@ -7935,6 +9139,12 @@ class TData:
             threshold then enter it here.
         clearBorder : bool
             Whether to remove objects touching the image border.
+        removeSmallDisconnected : bool
+            If True then it checks every object to see if it is made of 
+            multiple disconnected components. If it is then it deletes every 
+            part except for the part with the biggest area. It will probably be
+            a good idea that you then use areThreshold to remove small bits in 
+            case the remaining bit is small. 
         editMasksInPlace : bool
             If True then it edits the channels C directly.
         addAsNewChannel : bool
@@ -7946,14 +9156,13 @@ class TData:
             Whether to save the cleaned segmentation masks. Str will be the 
             name of the folder they are saved into. This deletes everything 
             except for the segmentation just before saving because SaveData 
-            doesn't yet have one channel only option.               
-        printWarnings : bool
-            Just lets you turn off warnings if they get annoying.    
+            doesn't yet have one channel only option.                  
         compress : bool
             Whether the saved files should be compressed or not.            
         """
         
-        _,_,_,_,C = self.parseTFMZC(C=C)
+        _,_,_,_,C = self.parseTFMZC(C=Segmentation,LoadMissingSegmention=True)
+        nc = len(C)
 
         if areaThreshold:
             if minAreaUnit=='um^2':
@@ -7963,70 +9172,267 @@ class TData:
         nt,nf,nm,nz,_,ny,nx = self.Shape
 
         new_masks = self.data[:,:,:,:,C].copy()
-        
-        if clearBorder:
-            for c in C:
-                NQ1 = nt*nf*nm*nz
-                cb1 = clear_border(new_masks[:,:,:,:,c].reshape((NQ1,ny,nx)))
-                new_masks[:,:,:,:,c] = cb1.reshape((nt,nf,nm,nz,ny,nx))
 
         ranges = map(range,(nt,nf,nm,nz))
         for t,f,m,z in product(*ranges):
-            for c in C:
-                if circThreshold or areaThreshold:  
-                    props = measure.regionprops(self.data[t,f,m,z,c])
+            for i,c in enumerate(C):
+                if clearBorder:
+                    new_masks[t,f,m,z,i] = clear_border(new_masks[t,f,m,z,i])
+                if removeSmallDisconnected:
+                    unique_labs = np.unique(new_masks[t,f,m,z,i])
+                    for lab in unique_labs:
+                        if lab==0:
+                            continue
+                        lab_mask = (new_masks[t,f,m,z,i]==lab)
+                        lab2_mask,num_lab2 = label(lab_mask)
+                        if num_lab2>1:
+                            small_labs_mask = np.zeros_like(lab_mask)
+                            max_labs_mask = np.zeros_like(lab_mask)
+                            max_area = 0
 
+                            for lab2 in range(1,num_lab2+1):
+                                component_mask = (lab2_mask==lab2)
+                                area = np.sum(component_mask)
+                                if area>max_area:
+                                    max_area = area
+                                    small_labs_mask += max_labs_mask
+                                    max_labs_mask = component_mask
+                                else:
+                                    small_labs_mask += component_mask
+                                    
+                            new_masks[t,f,m,z,i][small_labs_mask] = 0
+                if circThreshold or areaThreshold:  
+                    props = measure.regionprops(new_masks[t,f,m,z,i])
                 if circThreshold:
                     for region in props:
                         circ = (region.perimeter**2)/(4*np.pi*region.area)
                         if circ < circThreshold:
                             L1 = region.label
-                            new_masks[t,f,m,z,c][new_masks[t,f,m,z,c]==L1] = 0
-                        
+                            new_masks[t,f,m,z,i][new_masks[t,f,m,z,i]==L1] = 0  
+                # it's good to do area last, disconnected and border can leave small bits!!
                 if areaThreshold:
                     for region in props:
                         if region.area < areaThreshold:
                             L1 = region.label
-                            new_masks[t,f,m,z,c][new_masks[t,f,m,z,c]==L1] = 0
-
+                            new_masks[t,f,m,z,i][new_masks[t,f,m,z,i]==L1] = 0
         if addAsNewChannel or saveSegmentationsAndDelete:
             new_names = []
-            for c in C:
+            for i,c in enumerate(C):
                 new_name = self.Chan2[c]
                 if clearBorder:
                     new_name += '_borderCleared'
                 if areaThreshold:
-                    areaT_str = str(_areaThreshold).replace('.','p')
+                    areaT_str = str(areaThreshold).replace('.','p')
                     new_name += '_areaThreshold'+areaT_str
                 if circThreshold:
-                    circT_str = str(_circThreshold).replace('.','p')
+                    circT_str = str(circThreshold).replace('.','p')
                     new_name += '_circThreshold'+circT_str
+                if removeSmallDisconnected:
+                    new_name += '_noDisconnected'
                 new_names.append(new_name)
-                self.AddArray(new_masks[:,:,:,:,[c]],new_name)  
+                self.AddArray(new_masks[:,:,:,:,[i]],new_name)  
         if saveSegmentationsAndDelete:
             self.TakeSubStack(C=new_names,updateNewSeshNQ=True)
             self.SaveData(saveSegmentationsAndDelete,compress=compress)        
         if editMasksInPlace:
             self.data[:,:,:,:,C] = new_masks 
 
+
+    def RemoveUnmatchedSegmentationObjects(self,
+                                           Segmentation1,
+                                           Segmentation2,
+                                           saveSeg1AndDelete=False,
+                                           saveSeg2AndDelete=False,
+                                           addSeg1AsNewChannel='auto',
+                                           addSeg2AsNewChannel='auto',
+                                           editSeg1InPlace=False,
+                                           editSeg2InPlace=False,
+                                           compress=True):
+        """
+        This takes two Segmentations which must be labelled and matching (e.g. 
+        like each cytoplasm and associated nuclei have the same label, see 
+        XFold.AlignSegmentationLabels()) and removes objects (i.e. labels) in 
+        either if they don't appear in both. Note that this is nothing to do 
+        with where labels appear, i.e. nothing about whether things overlap... 
+        just about whether a label appears or not. It is used e.g when you 
+        have 'cleaned' 2 matching segmentations and want objects to be removed 
+        in both if removed in one.
+        
+        Parameters
+        ----------
+        Segmentation1/Segmentation2 : {int,str,ms.XFold}
+            The Segmentation sets you want to process. It doesn't have to be 
+            loaded already. See tdata.parseTFMZC() for accepted formats.
+        saveSeg1AndDelete,saveSeg2AndDelete : str
+            The filepaths to save the new segmentation datasets. If no file 
+            divisors here it is assumed to be in self's parent directory. Put 
+            False if you don't want to save. TData has to be deleted afterwards
+            because of problem of SaveData only saving all channels.
+        addSeg1AsNewChannel,addSeg2AsNewChannel : {bool,'auto',str}
+            If True or str then it adds the new masks as new channels. If True 
+            or 'auto' the Chan2 name will be made from the segmentation 
+            dataset name +"_UnmatchedRemoved" and passed through 
+            tdata.parseSegNameToChan2. If a different str is provided then the 
+            Chan2 name is this str passed through tdata.parseSegNameToChan2().
+        editSeg1InPlace,editSeg2InPlace : bool
+            If True then it edits the Segmentation directly in the TData.         
+        compress : bool
+            Whether the saved files should be compressed or not.              
+        """
+        _,_,_,_,C1 = self.parseTFMZC(C=Segmentation1,LoadMissingSegmention=True)
+        _,_,_,_,C2 = self.parseTFMZC(C=Segmentation2,LoadMissingSegmention=True)
+
+        if editSeg1InPlace:
+            seg1 = self.data[:,:,:,:,C1]
+        else:
+            seg1 = self.data[:,:,:,:,C1].copy()
+        if editSeg2InPlace:
+            seg2 = self.data[:,:,:,:,C2]
+        else:
+            seg2 = self.data[:,:,:,:,C2].copy()
+        
+        ranges = map(range,self.Shape[:4])
+        for t,f,m,z in product(*ranges):
+
+            seg1[t,f,m,z,0][np.isin(seg1[t,f,m,z,0],
+                                    seg2[t,f,m,z,0],
+                                    invert=True)] = 0
             
+            seg2[t,f,m,z,0][np.isin(seg2[t,f,m,z,0],
+                                    seg1[t,f,m,z,0],
+                                    invert=True)] = 0
+
+        # you have to do this because advanced indexing above caused change to 
+        # happen to a copy even though seg1 is otherwise a view!
+        if editSeg1InPlace:
+            self.data[:,:,:,:,C1] = seg1
+        if editSeg2InPlace:
+            self.data[:,:,:,:,C2] = seg2
+        
+        if saveSeg1AndDelete or addSeg1AsNewChannel:
+            if isinstance(addSeg1AsNewChannel,str) and addSeg1AsNewChannel!='auto':
+                chan_name1 = addSeg1AsNewChannel
+            else:
+                chan_name1 = self.Chan2[C1[0]]+"_UnmatchedRemoved"
+            self.AddArray(seg1,chan_name1)
+        if saveSeg2AndDelete or addSeg2AsNewChannel:
+            if isinstance(addSeg2AsNewChannel,str) and addSeg2AsNewChannel!='auto':
+                chan_name22 = addSeg2AsNewChannel
+            else:
+                chan_name2 = self.Chan2[C2[0]]+"_UnmatchedRemoved"
+            self.AddArray(seg2,chan_name2)     
+        if saveSeg1AndDelete or saveSeg2AndDelete:
+            self.TakeSubStack(C=[chan_name1,chan_name2],updateNewSeshNQ=True)
+        if saveSeg1AndDelete and saveSeg2AndDelete:
+            tdata2 = self.Duplicate()            
+            tdata2.TakeSubStack(C=chan_name1,updateNewSeshNQ=True)
+            tdata2.SaveData(saveSeg1AndDelete,compress=compress)    
+            self.TakeSubStack(C=chan_name2,updateNewSeshNQ=True)
+            self.SaveData(saveSeg2AndDelete,compress=compress)    
+        elif saveSeg1AndDelete:
+            self.TakeSubStack(C=chan_name1,updateNewSeshNQ=True)
+            self.SaveData(saveSeg1AndDelete,compress=compress)   
+        elif saveSeg2AndDelete:
+            self.TakeSubStack(C=chan_name2,updateNewSeshNQ=True)
+            self.SaveData(saveSeg2AndDelete,compress=compress)              
+    
+
+    def BranchesAndBodiesFromMask(self,
+                               Segmentation,
+                               opening_size,
+                               saveBodiesAndDelete=False,
+                               saveBranchesAndDelete=False,
+                               addBodiesAsNewChannels=True,
+                               addBranchesAsNewChannels=True,
+                               compress=True):
+        """
+        This takes the specified masks and uses morphological opening to 
+        separate them into branches (bits that are removed upon opening) and 
+        bodies (what's left after opening). It saves both mask sets.
+        
+        Parameters
+        ----------
+        Segmentation : {int,str,ms.XFold}
+            The Segmentation set you want to process. It doesn't have to be 
+            loaded already. str must be a filepath to root folder of dataset 
+            or if no file divisors found it is assumed to be in self's parent 
+            directory. Or directly give the XFold of the dataset.
+        opening_size : int
+            The size of the footprint used in opening.
+        saveBodiesAndDelete,saveBranchesAndDelete : str
+            The filepaths to save the new segmentation datasets. If no file 
+            divisors here it is assumed to be in self's parent directory. Put 
+            False if you don't want to save.
+        addBodiesAsNewChannels,addBranchesAsNewChannels : {bool,str}
+            If True then it makes the new masks and adds them as new channels with 
+            the name of the Segmentation Chan2 + '_branches' and + '_bodies'.
+        compress : bool
+            Whether the saved files should be compressed or not.              
+        """
+        _,_,_,_,C = self.parseTFMZC(C=Segmentation,LoadMissingSegmention=True)
+        
+        fpr = np.ones((opening_size,opening_size))
+
+        nt,nf,nm,nz,_,ny,nx = self.Shape
+        nc = len(C)
+
+        bodies_mask = np.zeros((nt,nf,nm,nz,nc,ny,nx),dtype='bool')
+        branches_mask = np.zeros((nt,nf,nm,nz,nc,ny,nx),dtype='bool')
+        
+        ranges = map(range,(nt,nf,nm,nz))
+        for t,f,m,z in product(*ranges):
+            for i,c in enumerate(C):
+                data = self.data[t,f,m,z,c]
+                bodies_mask[t,f,m,z,i] = binary_opening(data,footprint=fpr)
+                branches_mask[t,f,m,z,i] = np.logical_xor(data,bodies_mask)
+
+        new_chans = []
+        body_chans = []
+        branch_chans = []
+        if saveBodiesAndDelete or addBodiesAsNewChannels:
+            for i,c in enumerate(C):
+                body_chan_name = self.Chan2[c]+'_Body'
+                new_chans.append(body_chan_name)
+                body_chans.append(body_chan_name)
+                self.AddArray(bodies_mask[:,:,:,:,[i]],body_chan_name) 
+        if saveBranchesAndDelete or addBranchesAsNewChannels:
+            for i,c in enumerate(C):
+                branches_chan_name = self.Chan2[c]+'_Branches'
+                new_chans.append(branches_chan_name)
+                branch_chans.append(branches_chan_name)
+                self.AddArray(branches_mask[:,:,:,:,[i]],branches_chan_name)  
+                
+        if saveBodiesAndDelete or saveBranchesAndDelete:
+            self.TakeSubStack(C=new_chans,updateNewSeshNQ=True)
+        # remember this next bit is unnecessarily complicated just because 
+        # SaveData can't save subsets of channels
+        if saveBodiesAndDelete and saveBranchesAndDelete:
+            tdata2 = self.Duplicate()
+            tdata2.TakeSubStack(C=body_chans,updateNewSeshNQ=True)
+            tdata2.SaveData(saveBodiesAndDelete,compress=compress)    
+            self.TakeSubStack(C=branch_chans,updateNewSeshNQ=True)
+            self.SaveData(saveBranchesAndDelete,compress=compress)                
+        elif saveBranchesAndDelete:
+            self.TakeSubStack(C=branch_chans,updateNewSeshNQ=True)
+            self.SaveData(saveBranchesAndDelete,compress=compress)       
+        elif saveBodiesAndDelete:
+            self.TakeSubStack(C=body_chans,updateNewSeshNQ=True)
+            self.SaveData(saveBodiesAndDelete,compress=compress)              
+
+
     def TrackSegmentations(self,
                            out_name,
-                           Segmentation=False,
+                           Segmentation='Segmentation',
                            returnMasks=False,
                            saveSegmentationsAndDelete=True,
                            editMasksInPlace=False,
-                           addAsNewChannel=False, 
+                           addSeg2TData=False, 
                            returnTracks=False,
                            T='all',
                            F='all',
                            M='all',
                            Z='all',
-                           assumeConstantDims='auto',
-                           FieldIDMapList='auto',
-                           SaveXFoldPickle=False,
-                           LoadFromPickle=False,
-                           compress=False):
+                           compress=True):
         """
         This does tracking of objects in a Segmentation associated with this 
         TData through the time dimension. 
@@ -8050,38 +9456,36 @@ class TData:
             The name of the directory where the tracks (h5 files) and tracked 
             masks (if saveMask is True) will be stored. It is assumed to be in 
             the parent directory of the XFold.    
-        Segmentation : False or str
-            If False then there must be a channel called 'Segmentation' in the 
-            TData. Otherwise you give it a string which isthe absolute path to 
-            the multisesh saved segmentation dataset corresponding to the 
-            ParentXFold. It will check if this XFold is already loaded to 
-            self.ParentXFold.SegmentationXFolds and load it with 
-            self.get_segmenbtation_xfold() if not. If you give it a string with
-            no directory separators the it joins it to XPathP.
+        Segmentation : {str,ms.XFold}
+            You give it a string to specify the segmentation channel. It will 
+            attempt to load what you specify if it isn't found in self 
+            already. See parseTFMZC for accepted formats.
         saveSegmentationsAndDelete : bool 
             Whether to save the tracked segmentations. If so they will be 
             saved in the folder specified by out_name. Otherwise it just saves 
             the track files.  
         editMasksInPlace : bool
             If True then it edits the channel that has been tracked directly.
-        addAsNewChannel : bool
-            If True then it makes a new mask and adds as a new channel with 
-            the same name as before but with 
-            '_Tracked' added.      
+        addSeg2TData : bool
+            If a str then the tracked masks will be added as a new channel to 
+            the TData. If 'auto' then an automatic Chan2 name will be created,
+            basically the old name +"_Tracked", otherwise your specified string
+            will be used (after passing through self.parseSegNameToChan2().
         returnTracks : bool
             Whether to return the tracks data. It is a list of of lists of
             btrack.btypes.Tracklet objects which contain all tracking data... 
             table is shown when executed. I.e. the top level list is one 
             element for each f,m,z combination. And the next level is one 
             track object for each track in that f,m,z time series.
-        T,F,M,Z : 'all' or int or list of int (str for F,C too)
+        T,F,M,Z : {'all',int,list,tuple,range,str}
             Which of the TData's times, fields, tiles and slices to load. All 
             normal formats accepted (see parseTFMZC()).  
         compress : bool
             Whether the saved files should be compressed or not.
         """
         
-        fp = os.path.join(self.ParentXFold.XPathP,out_name)        
+        #fp = os.path.join(self.ParentXFold.XPathP,out_name)  
+        fp = out_name
 
         FEATURES = [
             "area", 
@@ -8090,25 +9494,19 @@ class TData:
             "orientation", 
             "solidity"]                             
                   
-        TT,FF,MM,ZZ,_ = self.parseTFMZC(T=T,F=F,M=M,Z=Z)  
-
-        if Segmentation and 'Segmentation' in self.Chan:
-            print(EM.tr1)
-        if Segmentation:
-            self.LoadSegmentationChannel(Segmentation,
-                                         assumeConstantDims=assumeConstantDims,
-                                         FieldIDMapList=FieldIDMapList,
-                                         SaveXFoldPickle=SaveXFoldPickle,
-                                         LoadFromPickle=LoadFromPickle,)
-        else:
-            assert 'Segmentation' in self.Chan,EM.ts1
+        TT,FF,MM,ZZ,CC = self.parseTFMZC(T=T,
+                                         F=F,
+                                         M=M,
+                                         Z=Z,
+                                         C=Segmentation,
+                                         LoadMissingSegmention=True)  
 
         if returnTracks:
             all_tracks = []
 
-        for f,m,z in product(FF,MM,ZZ):
+        for f,m,z,c in product(FF,MM,ZZ,CC):
 
-            masks = self.data[TT,f,m,z,self.chan_index('Segmentation')]
+            masks = self.data[TT,f,m,z,c]
 
             # create btrack objects (with properties) from the segmentation data
             # (you can also calculate properties, 
@@ -8150,7 +9548,7 @@ class TData:
             
             makeMasksQ = any((saveSegmentationsAndDelete,
                              editMasksInPlace,
-                             addAsNewChannel))
+                             addSeg2TData))
             if makeMasksQ:
                 trk_masks = np.zeros_like(masks)
                 for track in tracks:
@@ -8168,20 +9566,34 @@ class TData:
                                 t = track['t'][i]
                                 old_label = masks[t,y,x]
                                 new_lab = track['ID']
-                                #print('time ',t,' same ',old_label==new_lab,' old ',old_label,' new ',new_lab)
                                 trk_masks[t][masks[t]==old_label] = new_lab
-            if saveSegmentationsAndDelete or addAsNewChannel:
-                chan2_name = self.Chan2[self.chan_index('Segmentation')] 
-                chan2_name += '_Tracked'
+
+            
+            if addSeg2TData:
+                assert isinstance(addSeg2TData,str),EM.seg1
+                if addSeg2TData=='auto':   
+                    chan2_name = self.Chan2[self.parseTFMZC(C='Segmentation')[4][0]] 
+                    chan2_name += '_Tracked'
+                else:
+                    chan2_name = self.parseSegNameToChan2(addSeg2TData) 
                 self.AddArray(trk_masks[:,np.newaxis,
                                               np.newaxis,
                                               np.newaxis,
-                                              np.newaxis,:,:],chan2_name)   
+                                              np.newaxis,:,:],chan2_name)
+            
             if saveSegmentationsAndDelete:
+                rand_name = str(random.randint(0,1000000))
+                chan2_name = 'Segmentation_'+rand_name
+                self.AddArray(trk_masks[:,np.newaxis,
+                                              np.newaxis,
+                                              np.newaxis,
+                                              np.newaxis,:,:],chan2_name)
                 self.TakeSubStack(C=chan2_name,updateNewSeshNQ=True)
                 self.SaveData(out_name,compress=compress)
+                
             if editMasksInPlace:
-                self.data[TT,f,m,z,self.chan_index('Segmentation')] = trk_masks
+                self.data[TT,f,m,z,self.parseTFMZC(C='Segmentation')[4]] = trk_masks
+                
             if returnTracks:
                 all_tracks.append(tracks)
 
@@ -8216,35 +9628,53 @@ class TData:
         This loads a segmentation to your TData. It must come from an XFold of 
         Segmentations that corresponds exactly to the Parent XFold of this 
         TData. It will check if the segmentation you specify is already loaded 
-        into self.ParentXFold.SegmentationXFolds and load it if not.
+        into self.ParentXFold.SegmentationXFolds and load it if not. It will 
+        also not load if it detects it is there already.
 
         Parameters
         -----------
-        Segmentation : str
+        Segmentation : {str,ms.XFold,list,tuple}
             Give it a string which is the absolute path to the segmentation 
             dataset  corresponding to self.ParentXFold. It will check if this 
             XFold is  already loaded to self.ParentXFold.SegmentationXFolds 
-            and load it with  self.LoadSegmentationXFold() if not. If you give 
-            it a  string with no directory separators the it joins it to 
-            XPathP.
+            and load it if not. If you give it a  string with no directory 
+            separators the it joins it to XPathP. Also accepts a segmentation 
+            xfold itself.
         Chan : str
             What to name the segmentation channel that you add. If you put 
-            'auto' it names it 'Segmentation_' plus what you provided for the 
-            parameter Segmentation - that way it is tracked where that channel 
+            'auto' it names it self.parseSegNameToChan2(Segmentation) 
+            - that way it is tracked where that channel 
             came from. Remember that any channels containing the string 
             'Segmentation' are are converted in the regularised self.Chan to 
             just 'Segmentation' and being called 'Segmentation' is required 
             for some functions rely on it being called this.
-        assumeConstantDims : bool or 'auto'       
-        FieldIDMapList : None or str or list of str or list of list of str 
+        assumeConstantDims : {bool,'auto'}
+            X
+        FieldIDMapList : {None,str,list,str.,list,list of str}
                          or 'get_FieldIDMapList_from_tags'   
+            X
         SaveXFoldPickle : bool or str
-        LoadFromPickle : bool or str
+            X
+        LoadFromPickle : {bool,str}
             All of these get passed to XFold __init__ when the new XFold is 
             made. If you choose 'auto' for assumeConstantDims or 
             FieldIDMapList then it sends the value from self to the new 
             __init__. 
         """ 
+        if isinstance(Segmentation,(list,tuple)):
+            for seg in Segmentation:
+                self.LoadSegmentationChannel(
+                                seg,
+                                Chan=Chan,
+                                assumeConstantDims=assumeConstantDims,
+                                FieldIDMapList=FieldIDMapList,
+                                SaveXFoldPickle=SaveXFoldPickle,
+                                LoadFromPickle=LoadFromPickle,)
+            return
+
+        if self.parseSegNameToChan2(Segmentation) in self.Chan2:
+            return
+            
         xf = self.get_segmentation_xfold(Segmentation,
                                          assumeConstantDims=assumeConstantDims,
                                          FieldIDMapList=FieldIDMapList,
@@ -8264,7 +9694,7 @@ class TData:
         td_seg = xf.makeTData(S=iss,T=t,F=f,M=m,Z=z,C='Segmentation')
 
         if Chan=='auto':
-            Chan = 'Segmentation_'+Segmentation
+            Chan = self.parseSegNameToChan2(Segmentation)
         
         self.AddArray(td_seg.data,Chan)
 
